@@ -18,6 +18,7 @@ import {
 } from "node:http";
 import { URL } from "node:url";
 import { ErrorHandler } from "./core/ErrorHandler.js";
+import { createRemoteJWKSet, jwtVerify, type JWTPayload } from "jose";
 
 const server = new Server(
   {
@@ -35,6 +36,57 @@ let discordService: DiscordService;
 let automationManager: AutomationManager;
 let discordController: DiscordController;
 
+const oauthEnabled = process.env.MCP_OAUTH_ENABLED === "true";
+const oauthIssuer =
+  process.env.MCP_OAUTH_ISSUER ||
+  process.env.SUPABASE_AUTH_BASE_URL ||
+  (process.env.SUPABASE_PROJECT_REF
+    ? `https://${process.env.SUPABASE_PROJECT_REF}.supabase.co/auth/v1`
+    : undefined);
+const oauthJwksUrl =
+  process.env.MCP_OAUTH_JWKS_URL ||
+  (oauthIssuer ? `${oauthIssuer}/.well-known/jwks.json` : undefined);
+const oauthAuthServers = (process.env.MCP_OAUTH_AUTHORIZATION_SERVERS || "")
+  .split(",")
+  .map((value) => value.trim())
+  .filter(Boolean);
+const oauthScopesSupported = (process.env.MCP_OAUTH_SCOPES_SUPPORTED || "")
+  .split(",")
+  .map((value) => value.trim())
+  .filter(Boolean);
+const oauthRequiredScopes = (process.env.MCP_OAUTH_REQUIRED_SCOPES || "")
+  .split(",")
+  .map((value) => value.trim())
+  .filter(Boolean);
+const oauthAudience = process.env.MCP_OAUTH_AUDIENCE;
+const oauthResource =
+  process.env.MCP_OAUTH_RESOURCE || process.env.MCP_PUBLIC_URL;
+const oauthConsentPath = process.env.MCP_OAUTH_CONSENT_PATH || "/oauth/consent";
+const supabaseUrl =
+  process.env.SUPABASE_URL ||
+  (process.env.SUPABASE_PROJECT_REF
+    ? `https://${process.env.SUPABASE_PROJECT_REF}.supabase.co`
+    : undefined);
+const supabaseAnonKey = process.env.SUPABASE_ANON_KEY;
+const oauthAllowedUserIds = (process.env.MCP_OAUTH_ALLOWED_USER_IDS || "")
+  .split(",")
+  .map((value) => value.trim())
+  .filter(Boolean);
+const oauthAllowedEmails = (process.env.MCP_OAUTH_ALLOWED_EMAILS || "")
+  .split(",")
+  .map((value) => value.trim().toLowerCase())
+  .filter(Boolean);
+let jwks: ReturnType<typeof createRemoteJWKSet> | null = null;
+const httpLoggingEnabled =
+  process.env.MCP_HTTP_LOG_REQUESTS !== "false" &&
+  process.env.ENABLE_LOGGING === "true";
+
+function logHttp(message: string): void {
+  if (!httpLoggingEnabled) return;
+  const timestamp = new Date().toISOString();
+  console.error(`[${timestamp}] [HTTP] ${message}`);
+}
+
 // Initialize Discord service
 async function initializeDiscord() {
   discordController = new DiscordController();
@@ -46,9 +98,315 @@ async function initializeDiscord() {
 function assertActionAllowed(action: string): void {
   const configManager = discordController?.getConfigManager?.();
   if (configManager && !configManager.isActionAllowed(action)) {
+    logHttp(`tool_blocked action=${action}`);
     throw ErrorHandler.createPermissionError(
       `Action '${action}' is not allowed`,
     );
+  }
+}
+
+function getRequestOrigin(req: IncomingMessage): string {
+  const host = req.headers.host || "";
+  const forwarded = req.headers["x-forwarded-proto"];
+  let proto = "https";
+  if (Array.isArray(forwarded)) {
+    proto = forwarded[0] || proto;
+  } else if (typeof forwarded === "string" && forwarded) {
+    proto = forwarded.split(",")[0].trim() || proto;
+  } else if (typeof req.headers["cf-visitor"] === "string") {
+    try {
+      const parsed = JSON.parse(req.headers["cf-visitor"]);
+      if (parsed?.scheme) proto = parsed.scheme;
+    } catch {
+      // ignore malformed header
+    }
+  }
+  return `${proto}://${host}`;
+}
+
+function getResourceUrl(req: IncomingMessage): string {
+  return oauthResource || getRequestOrigin(req);
+}
+
+function getResourceMetadataUrl(req: IncomingMessage): string {
+  return `${getResourceUrl(req)}/.well-known/oauth-protected-resource`;
+}
+
+function buildProtectedResourceMetadata(req: IncomingMessage) {
+  return {
+    resource: getResourceUrl(req),
+    authorization_servers:
+      oauthAuthServers.length > 0
+        ? oauthAuthServers
+        : oauthIssuer
+          ? [oauthIssuer]
+          : [],
+    scopes_supported:
+      oauthScopesSupported.length > 0 ? oauthScopesSupported : undefined,
+    resource_documentation: process.env.MCP_RESOURCE_DOCUMENTATION || undefined,
+  };
+}
+
+function buildConsentPageHtml(): string {
+  const missing = [];
+  if (!supabaseUrl) missing.push("SUPABASE_URL");
+  if (!supabaseAnonKey) missing.push("SUPABASE_ANON_KEY");
+
+  if (missing.length > 0) {
+    return `<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Consent</title>
+    <style>
+      body { font-family: Arial, sans-serif; padding: 32px; background: #0f1115; color: #e6e6e6; }
+      .card { max-width: 560px; margin: 0 auto; background: #171a21; padding: 24px; border-radius: 12px; }
+      code { background: #0f1115; padding: 2px 6px; border-radius: 6px; }
+    </style>
+  </head>
+  <body>
+    <div class="card">
+      <h2>Consent Page Misconfigured</h2>
+      <p>Missing required environment variables:</p>
+      <ul>
+        ${missing.map((item) => `<li><code>${item}</code></li>`).join("")}
+      </ul>
+    </div>
+  </body>
+</html>`;
+  }
+
+  return `<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Authorize MCP Access</title>
+    <style>
+      body { font-family: "Segoe UI", Arial, sans-serif; background: #0f1115; color: #e6e6e6; margin: 0; padding: 40px; }
+      .card { max-width: 640px; margin: 0 auto; background: #171a21; border-radius: 14px; padding: 28px; box-shadow: 0 8px 30px rgba(0,0,0,0.35); }
+      h1 { margin-top: 0; font-size: 22px; }
+      .muted { color: #9aa4b2; }
+      .scopes { margin: 16px 0; padding: 12px; background: #12161d; border-radius: 10px; }
+      .actions { display: flex; gap: 12px; margin-top: 24px; }
+      button { border: 0; padding: 10px 16px; border-radius: 10px; cursor: pointer; font-weight: 600; }
+      .approve { background: #3b82f6; color: white; }
+      .deny { background: #1f2937; color: #e6e6e6; }
+      .error { color: #f87171; margin-top: 12px; }
+      .hidden { display: none; }
+      .loading { color: #9aa4b2; }
+    </style>
+  </head>
+  <body>
+    <div class="card">
+      <h1>Authorize MCP Access</h1>
+      <p class="muted" id="clientName">Loading client details...</p>
+      <div class="scopes">
+        <strong>Requested access</strong>
+        <ul id="scopeList"><li class="loading">Loading scopes…</li></ul>
+      </div>
+      <div class="actions">
+        <button class="approve" id="approveBtn">Approve</button>
+        <button class="deny" id="denyBtn">Deny</button>
+      </div>
+      <p class="error hidden" id="errorBox"></p>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+    <script>
+      const supabaseUrl = ${JSON.stringify(supabaseUrl)};
+      const supabaseAnonKey = ${JSON.stringify(supabaseAnonKey)};
+      const { createClient } = supabase;
+
+      const errorBox = document.getElementById('errorBox');
+      const clientName = document.getElementById('clientName');
+      const scopeList = document.getElementById('scopeList');
+      const approveBtn = document.getElementById('approveBtn');
+      const denyBtn = document.getElementById('denyBtn');
+
+      function showError(message) {
+        errorBox.textContent = message;
+        errorBox.classList.remove('hidden');
+      }
+
+      function setLoading(message) {
+        clientName.textContent = message;
+      }
+
+      async function main() {
+        const params = new URLSearchParams(window.location.search);
+        const authorizationId = params.get('authorization_id');
+
+        if (!authorizationId) {
+          showError('Missing authorization_id in URL.');
+          approveBtn.disabled = true;
+          denyBtn.disabled = true;
+          return;
+        }
+
+        const supabaseClient = createClient(supabaseUrl, supabaseAnonKey, {
+          auth: { persistSession: false }
+        });
+
+        const { data, error } = await supabaseClient.auth.oauth.getAuthorizationDetails(authorizationId);
+        if (error || !data) {
+          showError(error?.message || 'Unable to load authorization details.');
+          approveBtn.disabled = true;
+          denyBtn.disabled = true;
+          return;
+        }
+
+        const requestedScopes = data?.requested_scopes || [];
+        clientName.textContent = data?.client?.name
+          ? \`App: \${data.client.name}\`
+          : 'App requesting access';
+
+        scopeList.innerHTML = '';
+        if (requestedScopes.length === 0) {
+          const li = document.createElement('li');
+          li.textContent = 'No scopes requested.';
+          scopeList.appendChild(li);
+        } else {
+          requestedScopes.forEach((scope) => {
+            const li = document.createElement('li');
+            li.textContent = scope;
+            scopeList.appendChild(li);
+          });
+        }
+
+        approveBtn.addEventListener('click', async () => {
+          const { data: approval, error: approveError } =
+            await supabaseClient.auth.oauth.approveAuthorization(authorizationId);
+          if (approveError || !approval?.redirect_to) {
+            showError(approveError?.message || 'Approval failed.');
+            return;
+          }
+          window.location.href = approval.redirect_to;
+        });
+
+        denyBtn.addEventListener('click', async () => {
+          const { data: denial, error: denyError } =
+            await supabaseClient.auth.oauth.denyAuthorization(authorizationId);
+          if (denyError || !denial?.redirect_to) {
+            showError(denyError?.message || 'Denial failed.');
+            return;
+          }
+          window.location.href = denial.redirect_to;
+        });
+      }
+
+      setLoading('Loading authorization details...');
+      main();
+    </script>
+  </body>
+</html>`;
+}
+
+function getBearerToken(req: IncomingMessage): string | null {
+  const header = req.headers.authorization;
+  if (!header) return null;
+  const value = Array.isArray(header) ? header[0] : header;
+  if (!value) return null;
+  if (value.startsWith("Bearer ")) return value.slice(7).trim();
+  return value.trim();
+}
+
+function buildWwwAuthenticate(req: IncomingMessage): string {
+  const scope =
+    oauthRequiredScopes.length > 0 ? oauthRequiredScopes.join(" ") : undefined;
+  const resourceMetadata = getResourceMetadataUrl(req);
+  if (scope) {
+    return `Bearer resource_metadata="${resourceMetadata}", scope="${scope}"`;
+  }
+  return `Bearer resource_metadata="${resourceMetadata}"`;
+}
+
+async function verifyOAuthToken(
+  token: string,
+  req: IncomingMessage,
+): Promise<JWTPayload> {
+  if (!oauthIssuer || !oauthJwksUrl) {
+    throw new Error(
+      "OAuth is enabled but issuer or JWKS URL is not configured.",
+    );
+  }
+  if (!jwks) {
+    jwks = createRemoteJWKSet(new URL(oauthJwksUrl));
+  }
+  const verifyOptions: Parameters<typeof jwtVerify>[2] = {
+    issuer: oauthIssuer,
+  };
+  if (oauthAudience) {
+    verifyOptions.audience = oauthAudience;
+  }
+  const { payload } = await jwtVerify(token, jwks, verifyOptions);
+
+  if (oauthResource) {
+    const expected = oauthResource;
+    const aud = payload.aud;
+    const resourceClaim = (payload as JWTPayload & { resource?: string })
+      .resource;
+    const audList = Array.isArray(aud) ? aud : aud ? [aud] : [];
+    if (resourceClaim !== expected && !audList.includes(expected)) {
+      throw new Error("Token audience/resource mismatch.");
+    }
+  }
+
+  if (oauthRequiredScopes.length > 0) {
+    const scopeValue = typeof payload.scope === "string" ? payload.scope : "";
+    const tokenScopes = scopeValue
+      .split(" ")
+      .map((value) => value.trim())
+      .filter(Boolean);
+    for (const required of oauthRequiredScopes) {
+      if (!tokenScopes.includes(required)) {
+        throw new Error(`Missing required scope: ${required}`);
+      }
+    }
+  }
+
+  if (oauthAllowedUserIds.length > 0) {
+    const userId = typeof payload.sub === "string" ? payload.sub : "";
+    if (!oauthAllowedUserIds.includes(userId)) {
+      throw new Error("User not allowed.");
+    }
+  }
+
+  if (oauthAllowedEmails.length > 0) {
+    const email =
+      typeof payload.email === "string" ? payload.email.toLowerCase() : "";
+    if (!email || !oauthAllowedEmails.includes(email)) {
+      throw new Error("User not allowed.");
+    }
+  }
+
+  return payload;
+}
+
+async function requireOAuth(
+  req: IncomingMessage,
+  res: ServerResponse,
+): Promise<JWTPayload | null> {
+  if (!oauthEnabled) return null;
+  const token = getBearerToken(req);
+  if (!token) {
+    res.writeHead(401, {
+      "Content-Type": "application/json",
+      "WWW-Authenticate": buildWwwAuthenticate(req),
+    });
+    res.end(JSON.stringify({ error: "Unauthorized" }));
+    return null;
+  }
+  try {
+    return await verifyOAuthToken(token, req);
+  } catch {
+    res.writeHead(401, {
+      "Content-Type": "application/json",
+      "WWW-Authenticate": buildWwwAuthenticate(req),
+    });
+    res.end(JSON.stringify({ error: "Unauthorized" }));
+    return null;
   }
 }
 
@@ -107,2508 +465,2581 @@ async function readBody(
   });
 }
 
+function classifyTool(name: string): {
+  readOnly: boolean;
+  destructive: boolean;
+} {
+  const readOnlyPrefixes = [
+    "get_",
+    "list_",
+    "find_",
+    "read_",
+    "search_",
+    "export_",
+  ];
+  const destructiveNames = new Set([
+    "discord_manage",
+    "bulk_delete_messages",
+    "comprehensive_channel_management",
+  ]);
+
+  const readOnly = readOnlyPrefixes.some((prefix) => name.startsWith(prefix));
+
+  const destructive =
+    destructiveNames.has(name) ||
+    name.startsWith("delete_") ||
+    name.includes("_delete_");
+
+  return { readOnly, destructive };
+}
+
+function applyToolMetadata(tool: Record<string, any>): Record<string, any> {
+  const { readOnly, destructive } = classifyTool(tool.name);
+  const annotations = {
+    readOnlyHint: readOnly,
+    openWorldHint: readOnly ? false : false,
+    destructiveHint: readOnly ? false : destructive,
+  };
+  const visibility = "public";
+
+  return {
+    ...tool,
+    annotations,
+    _meta: {
+      ...(tool._meta || {}),
+      "openai/visibility": visibility,
+    },
+  };
+}
+
 // Complete tools list for both stdio and HTTP
-const getAllTools = () => [
-  // Consolidated Discord Management Tool
-  {
-    name: "discord_manage",
-    description:
-      "Comprehensive Discord server management tool - handles all Discord operations through a single unified interface",
-    inputSchema: {
-      type: "object",
-      properties: {
-        action: {
-          type: "string",
-          enum: [
-            "get_server_info",
-            "send_message",
-            "edit_message",
-            "delete_message",
-            "read_messages",
-            "pin_message",
-            "unpin_message",
-            "get_pinned_messages",
-            "bulk_delete_messages",
-            "crosspost_message",
-            "get_message_history",
-            "get_message_attachments",
-            "read_images",
-            "get_user_id_by_name",
-            "send_private_message",
-            "edit_private_message",
-            "delete_private_message",
-            "read_private_messages",
-            "add_reaction",
-            "remove_reaction",
-            "create_text_channel",
-            "create_voice_channel",
-            "create_forum_channel",
-            "create_announcement_channel",
-            "create_stage_channel",
-            "edit_channel_advanced",
-            "delete_channel",
-            "find_channel",
-            "list_channels",
-            "set_channel_position",
-            "set_channel_positions",
-            "move_channel_to_category",
-            "organize_channels",
-            "get_channel_structure",
-            "create_category",
-            "delete_category",
-            "find_category",
-            "list_channels_in_category",
-            "set_category_position",
-            "create_webhook",
-            "delete_webhook",
-            "list_webhooks",
-            "send_webhook_message",
-            "join_voice_channel",
-            "leave_voice_channel",
-            "play_audio",
-            "stop_audio",
-            "set_volume",
-            "get_voice_connections",
-            "create_role",
-            "delete_role",
-            "edit_role",
-            "add_role_to_member",
-            "remove_role_from_member",
-            "get_roles",
-            "set_role_positions",
-            "get_members",
-            "search_members",
-            "edit_member",
-            "get_member_info",
-            "create_event",
-            "edit_event",
-            "delete_event",
-            "get_events",
-            "create_invite",
-            "delete_invite",
-            "get_invites",
-            "create_emoji",
-            "delete_emoji",
-            "get_emojis",
-            "create_sticker",
-            "delete_sticker",
-            "get_stickers",
-            "upload_file",
-            "set_channel_private",
-            "set_category_private",
-            "bulk_set_privacy",
-            "comprehensive_channel_management",
-            "create_automod_rule",
-            "edit_automod_rule",
-            "delete_automod_rule",
-            "get_automod_rules",
-            "send_modal",
-            "send_embed",
-            "send_button",
-            "send_select_menu",
-            "edit_server",
-            "get_server_widget",
-            "get_welcome_screen",
-            "edit_welcome_screen",
-            "get_server_stats",
-            "export_chat_log",
-          ],
-          description: "The specific Discord operation to perform",
-        },
-      },
-      required: ["action"],
-      additionalProperties: true,
-    },
-  },
-
-  // Original Individual Tools (kept for backward compatibility)
-  // Server Information
-  {
-    name: "get_server_info",
-    description: "Get detailed discord server information",
-    inputSchema: {
-      type: "object",
-      properties: {
-        guildId: {
-          type: "string",
-          description: "Discord server ID",
-        },
-      },
-      required: [],
-    },
-  },
-  // Message Management
-  {
-    name: "send_message",
-    description: "Send a message to a specific channel",
-    inputSchema: {
-      type: "object",
-      properties: {
-        channelId: {
-          type: "string",
-          description: "Discord channel ID",
-        },
-        message: {
-          type: "string",
-          description: "Message content",
-        },
-      },
-      required: ["channelId", "message"],
-    },
-  },
-  {
-    name: "edit_message",
-    description: "Edit a message from a specific channel",
-    inputSchema: {
-      type: "object",
-      properties: {
-        channelId: {
-          type: "string",
-          description: "Discord channel ID",
-        },
-        messageId: {
-          type: "string",
-          description: "Specific message ID",
-        },
-        newMessage: {
-          type: "string",
-          description: "New message content",
-        },
-      },
-      required: ["channelId", "messageId", "newMessage"],
-    },
-  },
-  {
-    name: "delete_message",
-    description: "Delete a message from a specific channel",
-    inputSchema: {
-      type: "object",
-      properties: {
-        channelId: {
-          type: "string",
-          description: "Discord channel ID",
-        },
-        messageId: {
-          type: "string",
-          description: "Specific message ID",
-        },
-      },
-      required: ["channelId", "messageId"],
-    },
-  },
-  {
-    name: "read_messages",
-    description: "Read recent message history from a specific channel",
-    inputSchema: {
-      type: "object",
-      properties: {
-        channelId: {
-          type: "string",
-          description: "Discord channel ID",
-        },
-        count: {
-          type: "string",
-          description: "Number of messages to retrieve",
-        },
-      },
-      required: ["channelId"],
-    },
-  },
-  {
-    name: "get_user_id_by_name",
-    description:
-      "Get a Discord user's ID by username in a guild for ping usage <@id>.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        username: {
-          type: "string",
-          description: "Discord username (optionally username#discriminator)",
-        },
-        guildId: {
-          type: "string",
-          description: "Discord server ID",
-        },
-      },
-      required: ["username"],
-    },
-  },
-  {
-    name: "send_private_message",
-    description: "Send a private message to a specific user",
-    inputSchema: {
-      type: "object",
-      properties: {
-        userId: {
-          type: "string",
-          description: "Discord user ID",
-        },
-        message: {
-          type: "string",
-          description: "Message content",
-        },
-      },
-      required: ["userId", "message"],
-    },
-  },
-  {
-    name: "edit_private_message",
-    description: "Edit a private message from a specific user",
-    inputSchema: {
-      type: "object",
-      properties: {
-        userId: {
-          type: "string",
-          description: "Discord user ID",
-        },
-        messageId: {
-          type: "string",
-          description: "Specific message ID",
-        },
-        newMessage: {
-          type: "string",
-          description: "New message content",
-        },
-      },
-      required: ["userId", "messageId", "newMessage"],
-    },
-  },
-  {
-    name: "delete_private_message",
-    description: "Delete a private message from a specific user",
-    inputSchema: {
-      type: "object",
-      properties: {
-        userId: {
-          type: "string",
-          description: "Discord user ID",
-        },
-        messageId: {
-          type: "string",
-          description: "Specific message ID",
-        },
-      },
-      required: ["userId", "messageId"],
-    },
-  },
-  {
-    name: "read_private_messages",
-    description: "Read recent message history from a specific user",
-    inputSchema: {
-      type: "object",
-      properties: {
-        userId: {
-          type: "string",
-          description: "Discord user ID",
-        },
-        count: {
-          type: "string",
-          description: "Number of messages to retrieve",
-        },
-      },
-      required: ["userId"],
-    },
-  },
-  {
-    name: "add_reaction",
-    description: "Add a reaction (emoji) to a specific message",
-    inputSchema: {
-      type: "object",
-      properties: {
-        channelId: {
-          type: "string",
-          description: "Discord channel ID",
-        },
-        messageId: {
-          type: "string",
-          description: "Discord message ID",
-        },
-        emoji: {
-          type: "string",
-          description: "Emoji (Unicode or string)",
-        },
-      },
-      required: ["channelId", "messageId", "emoji"],
-    },
-  },
-  {
-    name: "remove_reaction",
-    description: "Remove a specified reaction (emoji) from a message",
-    inputSchema: {
-      type: "object",
-      properties: {
-        channelId: {
-          type: "string",
-          description: "Discord channel ID",
-        },
-        messageId: {
-          type: "string",
-          description: "Discord message ID",
-        },
-        emoji: {
-          type: "string",
-          description: "Emoji (Unicode or string)",
-        },
-      },
-      required: ["channelId", "messageId", "emoji"],
-    },
-  },
-  // Channel Management
-  {
-    name: "create_text_channel",
-    description: "Create a new text channel",
-    inputSchema: {
-      type: "object",
-      properties: {
-        guildId: {
-          type: "string",
-          description: "Discord server ID",
-        },
-        name: {
-          type: "string",
-          description: "Channel name",
-        },
-        categoryId: {
-          type: "string",
-          description: "Category ID (optional)",
-        },
-      },
-      required: ["name"],
-    },
-  },
-  {
-    name: "create_voice_channel",
-    description: "Create a new voice channel",
-    inputSchema: {
-      type: "object",
-      properties: {
-        guildId: {
-          type: "string",
-          description: "Discord server ID",
-        },
-        name: {
-          type: "string",
-          description: "Voice channel name",
-        },
-        categoryId: {
-          type: "string",
-          description: "Category ID (optional)",
-        },
-        userLimit: {
-          type: "number",
-          description: "User limit (0-99, 0 = unlimited)",
-          minimum: 0,
-          maximum: 99,
-        },
-        bitrate: {
-          type: "number",
-          description:
-            "Bitrate in bps (8000-384000, depends on server boost level)",
-          minimum: 8000,
-          maximum: 384000,
-        },
-      },
-      required: ["name"],
-    },
-  },
-  {
-    name: "create_forum_channel",
-    description: "Create a forum channel with advanced settings",
-    inputSchema: {
-      type: "object",
-      properties: {
-        guildId: {
-          type: "string",
-          description: "Discord server ID",
-        },
-        name: {
-          type: "string",
-          description: "Forum channel name",
-        },
-        categoryId: {
-          type: "string",
-          description: "Category ID (optional)",
-        },
-        topic: {
-          type: "string",
-          description: "Channel topic/description",
-        },
-        slowmode: {
-          type: "number",
-          description: "Slowmode in seconds (0-21600)",
-          minimum: 0,
-          maximum: 21600,
-        },
-        defaultReactionEmoji: {
-          type: "string",
-          description: "Default reaction emoji for posts",
-        },
-        isPrivate: {
-          type: "boolean",
-          description: "Make channel private (deny @everyone access)",
-        },
-        allowedRoles: {
-          type: "array",
-          items: { type: "string" },
-          description: "Role IDs to grant access to private channel",
-        },
-      },
-      required: ["name"],
-    },
-  },
-  {
-    name: "create_announcement_channel",
-    description: "Create an announcement channel with advanced settings",
-    inputSchema: {
-      type: "object",
-      properties: {
-        guildId: {
-          type: "string",
-          description: "Discord server ID",
-        },
-        name: {
-          type: "string",
-          description: "Announcement channel name",
-        },
-        categoryId: {
-          type: "string",
-          description: "Category ID (optional)",
-        },
-        topic: {
-          type: "string",
-          description: "Channel topic/description",
-        },
-        slowmode: {
-          type: "number",
-          description: "Slowmode in seconds (0-21600)",
-          minimum: 0,
-          maximum: 21600,
-        },
-        isPrivate: {
-          type: "boolean",
-          description: "Make channel private (deny @everyone access)",
-        },
-        allowedRoles: {
-          type: "array",
-          items: { type: "string" },
-          description: "Role IDs to grant access to private channel",
-        },
-      },
-      required: ["name"],
-    },
-  },
-  {
-    name: "create_stage_channel",
-    description: "Create a stage voice channel with advanced settings",
-    inputSchema: {
-      type: "object",
-      properties: {
-        guildId: {
-          type: "string",
-          description: "Discord server ID",
-        },
-        name: {
-          type: "string",
-          description: "Stage channel name",
-        },
-        categoryId: {
-          type: "string",
-          description: "Category ID (optional)",
-        },
-        topic: {
-          type: "string",
-          description: "Channel topic/description",
-        },
-        bitrate: {
-          type: "number",
-          description:
-            "Bitrate in bps (8000-384000, depends on server boost level)",
-          minimum: 8000,
-          maximum: 384000,
-        },
-        isPrivate: {
-          type: "boolean",
-          description: "Make channel private (deny @everyone access)",
-        },
-        allowedRoles: {
-          type: "array",
-          items: { type: "string" },
-          description: "Role IDs to grant access to private channel",
-        },
-      },
-      required: ["name"],
-    },
-  },
-  {
-    name: "edit_channel_advanced",
-    description:
-      "Edit any channel with advanced settings including privacy and permissions",
-    inputSchema: {
-      type: "object",
-      properties: {
-        guildId: {
-          type: "string",
-          description: "Discord server ID",
-        },
-        channelId: {
-          type: "string",
-          description: "Channel ID to edit",
-        },
-        name: {
-          type: "string",
-          description: "New channel name",
-        },
-        topic: {
-          type: "string",
-          description: "New channel topic/description",
-        },
-        slowmode: {
-          type: "number",
-          description: "Slowmode in seconds (0-21600)",
-          minimum: 0,
-          maximum: 21600,
-        },
-        userLimit: {
-          type: "number",
-          description: "User limit for voice channels (0-99, 0 = unlimited)",
-          minimum: 0,
-          maximum: 99,
-        },
-        bitrate: {
-          type: "number",
-          description: "Bitrate for voice channels (8000-384000)",
-          minimum: 8000,
-          maximum: 384000,
-        },
-        isPrivate: {
-          type: "boolean",
-          description: "Make channel private (deny @everyone access)",
-        },
-        allowedRoles: {
-          type: "array",
-          items: { type: "string" },
-          description: "Role IDs to grant access to private channel",
-        },
-        categoryId: {
-          type: ["string", "null"],
-          description: "Category ID (null to remove from category)",
-        },
-      },
-      required: ["channelId"],
-    },
-  },
-  {
-    name: "delete_channel",
-    description: "Delete a channel",
-    inputSchema: {
-      type: "object",
-      properties: {
-        guildId: {
-          type: "string",
-          description: "Discord server ID",
-        },
-        channelId: {
-          type: "string",
-          description: "Discord channel ID",
-        },
-      },
-      required: ["channelId"],
-    },
-  },
-  {
-    name: "find_channel",
-    description: "Find a channel type and ID using name and server ID",
-    inputSchema: {
-      type: "object",
-      properties: {
-        guildId: {
-          type: "string",
-          description: "Discord server ID",
-        },
-        channelName: {
-          type: "string",
-          description: "Discord channel name",
-        },
-      },
-      required: ["channelName"],
-    },
-  },
-  {
-    name: "list_channels",
-    description: "List of all channels",
-    inputSchema: {
-      type: "object",
-      properties: {
-        guildId: {
-          type: "string",
-          description: "Discord server ID",
-        },
-      },
-      required: [],
-    },
-  },
-  // Category Management
-  {
-    name: "create_category",
-    description: "Create a new category for channels",
-    inputSchema: {
-      type: "object",
-      properties: {
-        guildId: {
-          type: "string",
-          description: "Discord server ID",
-        },
-        name: {
-          type: "string",
-          description: "Discord category name",
-        },
-      },
-      required: ["name"],
-    },
-  },
-  {
-    name: "delete_category",
-    description: "Delete a category",
-    inputSchema: {
-      type: "object",
-      properties: {
-        guildId: {
-          type: "string",
-          description: "Discord server ID",
-        },
-        categoryId: {
-          type: "string",
-          description: "Discord category ID",
-        },
-      },
-      required: ["categoryId"],
-    },
-  },
-  {
-    name: "find_category",
-    description: "Find a category ID using name and server ID",
-    inputSchema: {
-      type: "object",
-      properties: {
-        guildId: {
-          type: "string",
-          description: "Discord server ID",
-        },
-        categoryName: {
-          type: "string",
-          description: "Discord category name",
-        },
-      },
-      required: ["categoryName"],
-    },
-  },
-  {
-    name: "list_channels_in_category",
-    description: "List of channels in a specific category",
-    inputSchema: {
-      type: "object",
-      properties: {
-        guildId: {
-          type: "string",
-          description: "Discord server ID",
-        },
-        categoryId: {
-          type: "string",
-          description: "Discord category ID",
-        },
-      },
-      required: ["categoryId"],
-    },
-  },
-  // Webhook Management
-  {
-    name: "create_webhook",
-    description: "Create a new webhook on a specific channel",
-    inputSchema: {
-      type: "object",
-      properties: {
-        channelId: {
-          type: "string",
-          description: "Discord channel ID",
-        },
-        name: {
-          type: "string",
-          description: "Webhook name",
-        },
-      },
-      required: ["channelId", "name"],
-    },
-  },
-  {
-    name: "delete_webhook",
-    description: "Delete a webhook",
-    inputSchema: {
-      type: "object",
-      properties: {
-        webhookId: {
-          type: "string",
-          description: "Discord webhook ID",
-        },
-      },
-      required: ["webhookId"],
-    },
-  },
-  {
-    name: "list_webhooks",
-    description: "List of webhooks on a specific channel",
-    inputSchema: {
-      type: "object",
-      properties: {
-        channelId: {
-          type: "string",
-          description: "Discord channel ID",
-        },
-      },
-      required: ["channelId"],
-    },
-  },
-  {
-    name: "send_webhook_message",
-    description: "Send a message via webhook",
-    inputSchema: {
-      type: "object",
-      properties: {
-        webhookUrl: {
-          type: "string",
-          description: "Discord webhook link",
-        },
-        message: {
-          type: "string",
-          description: "Message content",
-        },
-      },
-      required: ["webhookUrl", "message"],
-    },
-  },
-  // Voice & Audio Management
-  {
-    name: "join_voice_channel",
-    description: "Connect bot to voice channel",
-    inputSchema: {
-      type: "object",
-      properties: {
-        guildId: {
-          type: "string",
-          description: "Discord server ID",
-        },
-        channelId: {
-          type: "string",
-          description: "Voice channel ID",
-        },
-      },
-      required: ["guildId", "channelId"],
-    },
-  },
-  {
-    name: "leave_voice_channel",
-    description: "Disconnect from voice channel",
-    inputSchema: {
-      type: "object",
-      properties: {
-        guildId: {
-          type: "string",
-          description: "Discord server ID",
-        },
-        channelId: {
-          type: "string",
-          description: "Voice channel ID",
-        },
-      },
-      required: ["guildId", "channelId"],
-    },
-  },
-  {
-    name: "play_audio",
-    description: "Stream audio in voice channel",
-    inputSchema: {
-      type: "object",
-      properties: {
-        guildId: {
-          type: "string",
-          description: "Discord server ID",
-        },
-        audioUrl: {
-          type: "string",
-          description: "URL or path to audio file",
-        },
-      },
-      required: ["guildId", "audioUrl"],
-    },
-  },
-  {
-    name: "stop_audio",
-    description: "Stop current audio playback",
-    inputSchema: {
-      type: "object",
-      properties: {
-        guildId: {
-          type: "string",
-          description: "Discord server ID",
-        },
-      },
-      required: ["guildId"],
-    },
-  },
-  {
-    name: "set_volume",
-    description: "Adjust audio volume",
-    inputSchema: {
-      type: "object",
-      properties: {
-        guildId: {
-          type: "string",
-          description: "Discord server ID",
-        },
-        volume: {
-          type: "number",
-          description: "Volume level (0-200)",
-          minimum: 0,
-          maximum: 200,
-        },
-      },
-      required: ["guildId", "volume"],
-    },
-  },
-  {
-    name: "get_voice_connections",
-    description: "List active voice connections",
-    inputSchema: {
-      type: "object",
-      properties: {},
-      required: [],
-    },
-  },
-  // Role Management
-  {
-    name: "create_role",
-    description: "Create new server role",
-    inputSchema: {
-      type: "object",
-      properties: {
-        guildId: {
-          type: "string",
-          description: "Discord server ID",
-        },
-        name: {
-          type: "string",
-          description: "Name of the role",
-        },
-        color: {
-          type: "string",
-          description: "Role color (hex format)",
-        },
-        permissions: {
-          type: "array",
-          items: {
+const getAllTools = () => {
+  const tools = [
+    // Consolidated Discord Management Tool
+    {
+      name: "discord_manage",
+      description:
+        "Comprehensive Discord server management tool - handles all Discord operations through a single unified interface",
+      inputSchema: {
+        type: "object",
+        properties: {
+          action: {
             type: "string",
+            enum: [
+              "get_server_info",
+              "send_message",
+              "edit_message",
+              "delete_message",
+              "read_messages",
+              "pin_message",
+              "unpin_message",
+              "get_pinned_messages",
+              "bulk_delete_messages",
+              "crosspost_message",
+              "get_message_history",
+              "get_message_attachments",
+              "read_images",
+              "get_user_id_by_name",
+              "send_private_message",
+              "edit_private_message",
+              "delete_private_message",
+              "read_private_messages",
+              "add_reaction",
+              "remove_reaction",
+              "create_text_channel",
+              "create_voice_channel",
+              "create_forum_channel",
+              "create_announcement_channel",
+              "create_stage_channel",
+              "edit_channel_advanced",
+              "delete_channel",
+              "find_channel",
+              "list_channels",
+              "set_channel_position",
+              "set_channel_positions",
+              "move_channel_to_category",
+              "organize_channels",
+              "get_channel_structure",
+              "create_category",
+              "delete_category",
+              "find_category",
+              "list_channels_in_category",
+              "set_category_position",
+              "create_webhook",
+              "delete_webhook",
+              "list_webhooks",
+              "send_webhook_message",
+              "join_voice_channel",
+              "leave_voice_channel",
+              "play_audio",
+              "stop_audio",
+              "set_volume",
+              "get_voice_connections",
+              "create_role",
+              "delete_role",
+              "edit_role",
+              "add_role_to_member",
+              "remove_role_from_member",
+              "get_roles",
+              "set_role_positions",
+              "get_members",
+              "search_members",
+              "edit_member",
+              "get_member_info",
+              "create_event",
+              "edit_event",
+              "delete_event",
+              "get_events",
+              "create_invite",
+              "delete_invite",
+              "get_invites",
+              "create_emoji",
+              "delete_emoji",
+              "get_emojis",
+              "create_sticker",
+              "delete_sticker",
+              "get_stickers",
+              "upload_file",
+              "set_channel_private",
+              "set_category_private",
+              "bulk_set_privacy",
+              "comprehensive_channel_management",
+              "create_automod_rule",
+              "edit_automod_rule",
+              "delete_automod_rule",
+              "get_automod_rules",
+              "send_modal",
+              "send_embed",
+              "send_button",
+              "send_select_menu",
+              "edit_server",
+              "get_server_widget",
+              "get_welcome_screen",
+              "edit_welcome_screen",
+              "get_server_stats",
+              "export_chat_log",
+            ],
+            description: "The specific Discord operation to perform",
           },
-          description: "Array of permission names",
         },
+        required: ["action"],
+        additionalProperties: true,
       },
-      required: ["name"],
     },
-  },
-  {
-    name: "delete_role",
-    description: "Remove existing role",
-    inputSchema: {
-      type: "object",
-      properties: {
-        guildId: {
-          type: "string",
-          description: "Discord server ID",
-        },
-        roleId: {
-          type: "string",
-          description: "Role ID",
-        },
-      },
-      required: ["roleId"],
-    },
-  },
-  {
-    name: "edit_role",
-    description: "Modify role properties (name, color, permissions)",
-    inputSchema: {
-      type: "object",
-      properties: {
-        guildId: {
-          type: "string",
-          description: "Discord server ID",
-        },
-        roleId: {
-          type: "string",
-          description: "Role ID",
-        },
-        name: {
-          type: "string",
-          description: "New name for the role",
-        },
-        color: {
-          type: "string",
-          description: "New color (hex format)",
-        },
-        permissions: {
-          type: "array",
-          items: {
+
+    // Original Individual Tools (kept for backward compatibility)
+    // Server Information
+    {
+      name: "get_server_info",
+      description: "Get detailed discord server information",
+      inputSchema: {
+        type: "object",
+        properties: {
+          guildId: {
             type: "string",
+            description: "Discord server ID",
           },
-          description: "New permissions array",
         },
+        required: [],
       },
-      required: ["roleId"],
     },
-  },
-  {
-    name: "add_role_to_member",
-    description: "Assign role to member",
-    inputSchema: {
-      type: "object",
-      properties: {
-        guildId: {
-          type: "string",
-          description: "Discord server ID",
+    // Message Management
+    {
+      name: "send_message",
+      description: "Send a message to a specific channel",
+      inputSchema: {
+        type: "object",
+        properties: {
+          channelId: {
+            type: "string",
+            description: "Discord channel ID",
+          },
+          message: {
+            type: "string",
+            description: "Message content",
+          },
         },
-        userId: {
-          type: "string",
-          description: "Discord user ID",
-        },
-        roleId: {
-          type: "string",
-          description: "Role ID",
-        },
+        required: ["channelId", "message"],
       },
-      required: ["userId", "roleId"],
     },
-  },
-  {
-    name: "remove_role_from_member",
-    description: "Remove role from member",
-    inputSchema: {
-      type: "object",
-      properties: {
-        guildId: {
-          type: "string",
-          description: "Discord server ID",
+    {
+      name: "edit_message",
+      description: "Edit a message from a specific channel",
+      inputSchema: {
+        type: "object",
+        properties: {
+          channelId: {
+            type: "string",
+            description: "Discord channel ID",
+          },
+          messageId: {
+            type: "string",
+            description: "Specific message ID",
+          },
+          newMessage: {
+            type: "string",
+            description: "New message content",
+          },
         },
-        userId: {
-          type: "string",
-          description: "Discord user ID",
-        },
-        roleId: {
-          type: "string",
-          description: "Role ID",
-        },
+        required: ["channelId", "messageId", "newMessage"],
       },
-      required: ["userId", "roleId"],
     },
-  },
-  {
-    name: "get_roles",
-    description: "List all server roles",
-    inputSchema: {
-      type: "object",
-      properties: {
-        guildId: {
-          type: "string",
-          description: "Discord server ID",
+    {
+      name: "delete_message",
+      description: "Delete a message from a specific channel",
+      inputSchema: {
+        type: "object",
+        properties: {
+          channelId: {
+            type: "string",
+            description: "Discord channel ID",
+          },
+          messageId: {
+            type: "string",
+            description: "Specific message ID",
+          },
         },
+        required: ["channelId", "messageId"],
       },
-      required: [],
     },
-  },
-  {
-    name: "set_role_positions",
-    description: "Reorder role hierarchy",
-    inputSchema: {
-      type: "object",
-      properties: {
-        guildId: {
-          type: "string",
-          description: "Discord server ID",
+    {
+      name: "read_messages",
+      description: "Read recent message history from a specific channel",
+      inputSchema: {
+        type: "object",
+        properties: {
+          channelId: {
+            type: "string",
+            description: "Discord channel ID",
+          },
+          count: {
+            type: "string",
+            description: "Number of messages to retrieve",
+          },
         },
-        rolePositions: {
-          type: "array",
-          items: {
-            type: "object",
-            properties: {
-              roleId: {
-                type: "string",
-                description: "Role ID",
-              },
-              position: {
-                type: "number",
-                description: "New position",
-              },
+        required: ["channelId"],
+      },
+    },
+    {
+      name: "get_user_id_by_name",
+      description:
+        "Get a Discord user's ID by username in a guild for ping usage <@id>.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          username: {
+            type: "string",
+            description: "Discord username (optionally username#discriminator)",
+          },
+          guildId: {
+            type: "string",
+            description: "Discord server ID",
+          },
+        },
+        required: ["username"],
+      },
+    },
+    {
+      name: "send_private_message",
+      description: "Send a private message to a specific user",
+      inputSchema: {
+        type: "object",
+        properties: {
+          userId: {
+            type: "string",
+            description: "Discord user ID",
+          },
+          message: {
+            type: "string",
+            description: "Message content",
+          },
+        },
+        required: ["userId", "message"],
+      },
+    },
+    {
+      name: "edit_private_message",
+      description: "Edit a private message from a specific user",
+      inputSchema: {
+        type: "object",
+        properties: {
+          userId: {
+            type: "string",
+            description: "Discord user ID",
+          },
+          messageId: {
+            type: "string",
+            description: "Specific message ID",
+          },
+          newMessage: {
+            type: "string",
+            description: "New message content",
+          },
+        },
+        required: ["userId", "messageId", "newMessage"],
+      },
+    },
+    {
+      name: "delete_private_message",
+      description: "Delete a private message from a specific user",
+      inputSchema: {
+        type: "object",
+        properties: {
+          userId: {
+            type: "string",
+            description: "Discord user ID",
+          },
+          messageId: {
+            type: "string",
+            description: "Specific message ID",
+          },
+        },
+        required: ["userId", "messageId"],
+      },
+    },
+    {
+      name: "read_private_messages",
+      description: "Read recent message history from a specific user",
+      inputSchema: {
+        type: "object",
+        properties: {
+          userId: {
+            type: "string",
+            description: "Discord user ID",
+          },
+          count: {
+            type: "string",
+            description: "Number of messages to retrieve",
+          },
+        },
+        required: ["userId"],
+      },
+    },
+    {
+      name: "add_reaction",
+      description: "Add a reaction (emoji) to a specific message",
+      inputSchema: {
+        type: "object",
+        properties: {
+          channelId: {
+            type: "string",
+            description: "Discord channel ID",
+          },
+          messageId: {
+            type: "string",
+            description: "Discord message ID",
+          },
+          emoji: {
+            type: "string",
+            description: "Emoji (Unicode or string)",
+          },
+        },
+        required: ["channelId", "messageId", "emoji"],
+      },
+    },
+    {
+      name: "remove_reaction",
+      description: "Remove a specified reaction (emoji) from a message",
+      inputSchema: {
+        type: "object",
+        properties: {
+          channelId: {
+            type: "string",
+            description: "Discord channel ID",
+          },
+          messageId: {
+            type: "string",
+            description: "Discord message ID",
+          },
+          emoji: {
+            type: "string",
+            description: "Emoji (Unicode or string)",
+          },
+        },
+        required: ["channelId", "messageId", "emoji"],
+      },
+    },
+    // Channel Management
+    {
+      name: "create_text_channel",
+      description: "Create a new text channel",
+      inputSchema: {
+        type: "object",
+        properties: {
+          guildId: {
+            type: "string",
+            description: "Discord server ID",
+          },
+          name: {
+            type: "string",
+            description: "Channel name",
+          },
+          categoryId: {
+            type: "string",
+            description: "Category ID (optional)",
+          },
+        },
+        required: ["name"],
+      },
+    },
+    {
+      name: "create_voice_channel",
+      description: "Create a new voice channel",
+      inputSchema: {
+        type: "object",
+        properties: {
+          guildId: {
+            type: "string",
+            description: "Discord server ID",
+          },
+          name: {
+            type: "string",
+            description: "Voice channel name",
+          },
+          categoryId: {
+            type: "string",
+            description: "Category ID (optional)",
+          },
+          userLimit: {
+            type: "number",
+            description: "User limit (0-99, 0 = unlimited)",
+            minimum: 0,
+            maximum: 99,
+          },
+          bitrate: {
+            type: "number",
+            description:
+              "Bitrate in bps (8000-384000, depends on server boost level)",
+            minimum: 8000,
+            maximum: 384000,
+          },
+        },
+        required: ["name"],
+      },
+    },
+    {
+      name: "create_forum_channel",
+      description: "Create a forum channel with advanced settings",
+      inputSchema: {
+        type: "object",
+        properties: {
+          guildId: {
+            type: "string",
+            description: "Discord server ID",
+          },
+          name: {
+            type: "string",
+            description: "Forum channel name",
+          },
+          categoryId: {
+            type: "string",
+            description: "Category ID (optional)",
+          },
+          topic: {
+            type: "string",
+            description: "Channel topic/description",
+          },
+          slowmode: {
+            type: "number",
+            description: "Slowmode in seconds (0-21600)",
+            minimum: 0,
+            maximum: 21600,
+          },
+          defaultReactionEmoji: {
+            type: "string",
+            description: "Default reaction emoji for posts",
+          },
+          isPrivate: {
+            type: "boolean",
+            description: "Make channel private (deny @everyone access)",
+          },
+          allowedRoles: {
+            type: "array",
+            items: { type: "string" },
+            description: "Role IDs to grant access to private channel",
+          },
+        },
+        required: ["name"],
+      },
+    },
+    {
+      name: "create_announcement_channel",
+      description: "Create an announcement channel with advanced settings",
+      inputSchema: {
+        type: "object",
+        properties: {
+          guildId: {
+            type: "string",
+            description: "Discord server ID",
+          },
+          name: {
+            type: "string",
+            description: "Announcement channel name",
+          },
+          categoryId: {
+            type: "string",
+            description: "Category ID (optional)",
+          },
+          topic: {
+            type: "string",
+            description: "Channel topic/description",
+          },
+          slowmode: {
+            type: "number",
+            description: "Slowmode in seconds (0-21600)",
+            minimum: 0,
+            maximum: 21600,
+          },
+          isPrivate: {
+            type: "boolean",
+            description: "Make channel private (deny @everyone access)",
+          },
+          allowedRoles: {
+            type: "array",
+            items: { type: "string" },
+            description: "Role IDs to grant access to private channel",
+          },
+        },
+        required: ["name"],
+      },
+    },
+    {
+      name: "create_stage_channel",
+      description: "Create a stage voice channel with advanced settings",
+      inputSchema: {
+        type: "object",
+        properties: {
+          guildId: {
+            type: "string",
+            description: "Discord server ID",
+          },
+          name: {
+            type: "string",
+            description: "Stage channel name",
+          },
+          categoryId: {
+            type: "string",
+            description: "Category ID (optional)",
+          },
+          topic: {
+            type: "string",
+            description: "Channel topic/description",
+          },
+          bitrate: {
+            type: "number",
+            description:
+              "Bitrate in bps (8000-384000, depends on server boost level)",
+            minimum: 8000,
+            maximum: 384000,
+          },
+          isPrivate: {
+            type: "boolean",
+            description: "Make channel private (deny @everyone access)",
+          },
+          allowedRoles: {
+            type: "array",
+            items: { type: "string" },
+            description: "Role IDs to grant access to private channel",
+          },
+        },
+        required: ["name"],
+      },
+    },
+    {
+      name: "edit_channel_advanced",
+      description:
+        "Edit any channel with advanced settings including privacy and permissions",
+      inputSchema: {
+        type: "object",
+        properties: {
+          guildId: {
+            type: "string",
+            description: "Discord server ID",
+          },
+          channelId: {
+            type: "string",
+            description: "Channel ID to edit",
+          },
+          name: {
+            type: "string",
+            description: "New channel name",
+          },
+          topic: {
+            type: "string",
+            description: "New channel topic/description",
+          },
+          slowmode: {
+            type: "number",
+            description: "Slowmode in seconds (0-21600)",
+            minimum: 0,
+            maximum: 21600,
+          },
+          userLimit: {
+            type: "number",
+            description: "User limit for voice channels (0-99, 0 = unlimited)",
+            minimum: 0,
+            maximum: 99,
+          },
+          bitrate: {
+            type: "number",
+            description: "Bitrate for voice channels (8000-384000)",
+            minimum: 8000,
+            maximum: 384000,
+          },
+          isPrivate: {
+            type: "boolean",
+            description: "Make channel private (deny @everyone access)",
+          },
+          allowedRoles: {
+            type: "array",
+            items: { type: "string" },
+            description: "Role IDs to grant access to private channel",
+          },
+          categoryId: {
+            type: ["string", "null"],
+            description: "Category ID (null to remove from category)",
+          },
+        },
+        required: ["channelId"],
+      },
+    },
+    {
+      name: "delete_channel",
+      description: "Delete a channel",
+      inputSchema: {
+        type: "object",
+        properties: {
+          guildId: {
+            type: "string",
+            description: "Discord server ID",
+          },
+          channelId: {
+            type: "string",
+            description: "Discord channel ID",
+          },
+        },
+        required: ["channelId"],
+      },
+    },
+    {
+      name: "find_channel",
+      description: "Find a channel type and ID using name and server ID",
+      inputSchema: {
+        type: "object",
+        properties: {
+          guildId: {
+            type: "string",
+            description: "Discord server ID",
+          },
+          channelName: {
+            type: "string",
+            description: "Discord channel name",
+          },
+        },
+        required: ["channelName"],
+      },
+    },
+    {
+      name: "list_channels",
+      description: "List of all channels",
+      inputSchema: {
+        type: "object",
+        properties: {
+          guildId: {
+            type: "string",
+            description: "Discord server ID",
+          },
+        },
+        required: [],
+      },
+    },
+    // Category Management
+    {
+      name: "create_category",
+      description: "Create a new category for channels",
+      inputSchema: {
+        type: "object",
+        properties: {
+          guildId: {
+            type: "string",
+            description: "Discord server ID",
+          },
+          name: {
+            type: "string",
+            description: "Discord category name",
+          },
+        },
+        required: ["name"],
+      },
+    },
+    {
+      name: "delete_category",
+      description: "Delete a category",
+      inputSchema: {
+        type: "object",
+        properties: {
+          guildId: {
+            type: "string",
+            description: "Discord server ID",
+          },
+          categoryId: {
+            type: "string",
+            description: "Discord category ID",
+          },
+        },
+        required: ["categoryId"],
+      },
+    },
+    {
+      name: "find_category",
+      description: "Find a category ID using name and server ID",
+      inputSchema: {
+        type: "object",
+        properties: {
+          guildId: {
+            type: "string",
+            description: "Discord server ID",
+          },
+          categoryName: {
+            type: "string",
+            description: "Discord category name",
+          },
+        },
+        required: ["categoryName"],
+      },
+    },
+    {
+      name: "list_channels_in_category",
+      description: "List of channels in a specific category",
+      inputSchema: {
+        type: "object",
+        properties: {
+          guildId: {
+            type: "string",
+            description: "Discord server ID",
+          },
+          categoryId: {
+            type: "string",
+            description: "Discord category ID",
+          },
+        },
+        required: ["categoryId"],
+      },
+    },
+    // Webhook Management
+    {
+      name: "create_webhook",
+      description: "Create a new webhook on a specific channel",
+      inputSchema: {
+        type: "object",
+        properties: {
+          channelId: {
+            type: "string",
+            description: "Discord channel ID",
+          },
+          name: {
+            type: "string",
+            description: "Webhook name",
+          },
+        },
+        required: ["channelId", "name"],
+      },
+    },
+    {
+      name: "delete_webhook",
+      description: "Delete a webhook",
+      inputSchema: {
+        type: "object",
+        properties: {
+          webhookId: {
+            type: "string",
+            description: "Discord webhook ID",
+          },
+        },
+        required: ["webhookId"],
+      },
+    },
+    {
+      name: "list_webhooks",
+      description: "List of webhooks on a specific channel",
+      inputSchema: {
+        type: "object",
+        properties: {
+          channelId: {
+            type: "string",
+            description: "Discord channel ID",
+          },
+        },
+        required: ["channelId"],
+      },
+    },
+    {
+      name: "send_webhook_message",
+      description: "Send a message via webhook",
+      inputSchema: {
+        type: "object",
+        properties: {
+          webhookUrl: {
+            type: "string",
+            description: "Discord webhook link",
+          },
+          message: {
+            type: "string",
+            description: "Message content",
+          },
+        },
+        required: ["webhookUrl", "message"],
+      },
+    },
+    // Voice & Audio Management
+    {
+      name: "join_voice_channel",
+      description: "Connect bot to voice channel",
+      inputSchema: {
+        type: "object",
+        properties: {
+          guildId: {
+            type: "string",
+            description: "Discord server ID",
+          },
+          channelId: {
+            type: "string",
+            description: "Voice channel ID",
+          },
+        },
+        required: ["guildId", "channelId"],
+      },
+    },
+    {
+      name: "leave_voice_channel",
+      description: "Disconnect from voice channel",
+      inputSchema: {
+        type: "object",
+        properties: {
+          guildId: {
+            type: "string",
+            description: "Discord server ID",
+          },
+          channelId: {
+            type: "string",
+            description: "Voice channel ID",
+          },
+        },
+        required: ["guildId", "channelId"],
+      },
+    },
+    {
+      name: "play_audio",
+      description: "Stream audio in voice channel",
+      inputSchema: {
+        type: "object",
+        properties: {
+          guildId: {
+            type: "string",
+            description: "Discord server ID",
+          },
+          audioUrl: {
+            type: "string",
+            description: "URL or path to audio file",
+          },
+        },
+        required: ["guildId", "audioUrl"],
+      },
+    },
+    {
+      name: "stop_audio",
+      description: "Stop current audio playback",
+      inputSchema: {
+        type: "object",
+        properties: {
+          guildId: {
+            type: "string",
+            description: "Discord server ID",
+          },
+        },
+        required: ["guildId"],
+      },
+    },
+    {
+      name: "set_volume",
+      description: "Adjust audio volume",
+      inputSchema: {
+        type: "object",
+        properties: {
+          guildId: {
+            type: "string",
+            description: "Discord server ID",
+          },
+          volume: {
+            type: "number",
+            description: "Volume level (0-200)",
+            minimum: 0,
+            maximum: 200,
+          },
+        },
+        required: ["guildId", "volume"],
+      },
+    },
+    {
+      name: "get_voice_connections",
+      description: "List active voice connections",
+      inputSchema: {
+        type: "object",
+        properties: {},
+        required: [],
+      },
+    },
+    // Role Management
+    {
+      name: "create_role",
+      description: "Create new server role",
+      inputSchema: {
+        type: "object",
+        properties: {
+          guildId: {
+            type: "string",
+            description: "Discord server ID",
+          },
+          name: {
+            type: "string",
+            description: "Name of the role",
+          },
+          color: {
+            type: "string",
+            description: "Role color (hex format)",
+          },
+          permissions: {
+            type: "array",
+            items: {
+              type: "string",
             },
-            required: ["roleId", "position"],
+            description: "Array of permission names",
           },
-          description: "Array of role position updates",
         },
+        required: ["name"],
       },
-      required: ["rolePositions"],
     },
-  },
-  {
-    name: "set_channel_position",
-    description: "Move a channel to a specific position",
-    inputSchema: {
-      type: "object",
-      properties: {
-        guildId: {
-          type: "string",
-          description: "Discord server ID",
+    {
+      name: "delete_role",
+      description: "Remove existing role",
+      inputSchema: {
+        type: "object",
+        properties: {
+          guildId: {
+            type: "string",
+            description: "Discord server ID",
+          },
+          roleId: {
+            type: "string",
+            description: "Role ID",
+          },
         },
-        channelId: {
-          type: "string",
-          description: "Channel ID",
-        },
-        position: {
-          type: "number",
-          description: "New position (0-based)",
-        },
+        required: ["roleId"],
       },
-      required: ["channelId", "position"],
     },
-  },
-  {
-    name: "set_channel_positions",
-    description: "Move multiple channels to specific positions",
-    inputSchema: {
-      type: "object",
-      properties: {
-        guildId: {
-          type: "string",
-          description: "Discord server ID",
-        },
-        channelPositions: {
-          type: "array",
-          items: {
-            type: "object",
-            properties: {
-              channelId: {
-                type: "string",
-                description: "Channel ID",
-              },
-              position: {
-                type: "number",
-                description: "New position (0-based)",
-              },
+    {
+      name: "edit_role",
+      description: "Modify role properties (name, color, permissions)",
+      inputSchema: {
+        type: "object",
+        properties: {
+          guildId: {
+            type: "string",
+            description: "Discord server ID",
+          },
+          roleId: {
+            type: "string",
+            description: "Role ID",
+          },
+          name: {
+            type: "string",
+            description: "New name for the role",
+          },
+          color: {
+            type: "string",
+            description: "New color (hex format)",
+          },
+          permissions: {
+            type: "array",
+            items: {
+              type: "string",
             },
-            required: ["channelId", "position"],
+            description: "New permissions array",
           },
-          description: "Array of channel position updates",
         },
+        required: ["roleId"],
       },
-      required: ["channelPositions"],
     },
-  },
-  {
-    name: "move_channel_to_category",
-    description: "Move a channel to a category or remove it from a category",
-    inputSchema: {
-      type: "object",
-      properties: {
-        guildId: {
-          type: "string",
-          description: "Discord server ID",
+    {
+      name: "add_role_to_member",
+      description: "Assign role to member",
+      inputSchema: {
+        type: "object",
+        properties: {
+          guildId: {
+            type: "string",
+            description: "Discord server ID",
+          },
+          userId: {
+            type: "string",
+            description: "Discord user ID",
+          },
+          roleId: {
+            type: "string",
+            description: "Role ID",
+          },
         },
-        channelId: {
-          type: "string",
-          description: "Channel ID",
-        },
-        categoryId: {
-          type: ["string", "null"],
-          description: "Category ID (null to remove from category)",
-        },
+        required: ["userId", "roleId"],
       },
-      required: ["channelId", "categoryId"],
     },
-  },
-  {
-    name: "set_category_position",
-    description: "Move a category to a specific position",
-    inputSchema: {
-      type: "object",
-      properties: {
-        guildId: {
-          type: "string",
-          description: "Discord server ID",
+    {
+      name: "remove_role_from_member",
+      description: "Remove role from member",
+      inputSchema: {
+        type: "object",
+        properties: {
+          guildId: {
+            type: "string",
+            description: "Discord server ID",
+          },
+          userId: {
+            type: "string",
+            description: "Discord user ID",
+          },
+          roleId: {
+            type: "string",
+            description: "Role ID",
+          },
         },
-        categoryId: {
-          type: "string",
-          description: "Category ID",
-        },
-        position: {
-          type: "number",
-          description: "New position (0-based)",
-        },
+        required: ["userId", "roleId"],
       },
-      required: ["categoryId", "position"],
     },
-  },
-  {
-    name: "organize_channels",
-    description: "Comprehensive channel and category organization tool",
-    inputSchema: {
-      type: "object",
-      properties: {
-        guildId: {
-          type: "string",
-          description: "Discord server ID",
+    {
+      name: "get_roles",
+      description: "List all server roles",
+      inputSchema: {
+        type: "object",
+        properties: {
+          guildId: {
+            type: "string",
+            description: "Discord server ID",
+          },
         },
-        organization: {
-          type: "object",
-          properties: {
-            categories: {
-              type: "array",
-              items: {
-                type: "object",
-                properties: {
-                  categoryId: {
-                    type: "string",
-                    description: "Category ID",
-                  },
-                  position: {
-                    type: "number",
-                    description: "New position",
-                  },
+        required: [],
+      },
+    },
+    {
+      name: "set_role_positions",
+      description: "Reorder role hierarchy",
+      inputSchema: {
+        type: "object",
+        properties: {
+          guildId: {
+            type: "string",
+            description: "Discord server ID",
+          },
+          rolePositions: {
+            type: "array",
+            items: {
+              type: "object",
+              properties: {
+                roleId: {
+                  type: "string",
+                  description: "Role ID",
                 },
-                required: ["categoryId", "position"],
-              },
-              description: "Array of category position updates",
-            },
-            channels: {
-              type: "array",
-              items: {
-                type: "object",
-                properties: {
-                  channelId: {
-                    type: "string",
-                    description: "Channel ID",
-                  },
-                  position: {
-                    type: "number",
-                    description: "New position (optional)",
-                  },
-                  categoryId: {
-                    type: ["string", "null"],
-                    description:
-                      "Category ID (null to remove from category, optional)",
-                  },
+                position: {
+                  type: "number",
+                  description: "New position",
                 },
-                required: ["channelId"],
               },
-              description: "Array of channel updates",
+              required: ["roleId", "position"],
             },
+            description: "Array of role position updates",
           },
-          description: "Organization configuration",
         },
+        required: ["rolePositions"],
       },
-      required: ["organization"],
     },
-  },
-  {
-    name: "get_channel_structure",
-    description: "Get the current channel and category structure of the server",
-    inputSchema: {
-      type: "object",
-      properties: {
-        guildId: {
-          type: "string",
-          description: "Discord server ID",
+    {
+      name: "set_channel_position",
+      description: "Move a channel to a specific position",
+      inputSchema: {
+        type: "object",
+        properties: {
+          guildId: {
+            type: "string",
+            description: "Discord server ID",
+          },
+          channelId: {
+            type: "string",
+            description: "Channel ID",
+          },
+          position: {
+            type: "number",
+            description: "New position (0-based)",
+          },
         },
+        required: ["channelId", "position"],
       },
-      required: [],
     },
-  },
-
-  // Additional Message Management Tools
-  {
-    name: "pin_message",
-    description: "Pin a message in a channel",
-    inputSchema: {
-      type: "object",
-      properties: {
-        channelId: {
-          type: "string",
-          description: "Discord channel ID",
+    {
+      name: "set_channel_positions",
+      description: "Move multiple channels to specific positions",
+      inputSchema: {
+        type: "object",
+        properties: {
+          guildId: {
+            type: "string",
+            description: "Discord server ID",
+          },
+          channelPositions: {
+            type: "array",
+            items: {
+              type: "object",
+              properties: {
+                channelId: {
+                  type: "string",
+                  description: "Channel ID",
+                },
+                position: {
+                  type: "number",
+                  description: "New position (0-based)",
+                },
+              },
+              required: ["channelId", "position"],
+            },
+            description: "Array of channel position updates",
+          },
         },
-        messageId: {
-          type: "string",
-          description: "Message ID to pin",
-        },
+        required: ["channelPositions"],
       },
-      required: ["channelId", "messageId"],
     },
-  },
-  {
-    name: "unpin_message",
-    description: "Unpin a message in a channel",
-    inputSchema: {
-      type: "object",
-      properties: {
-        channelId: {
-          type: "string",
-          description: "Discord channel ID",
+    {
+      name: "move_channel_to_category",
+      description: "Move a channel to a category or remove it from a category",
+      inputSchema: {
+        type: "object",
+        properties: {
+          guildId: {
+            type: "string",
+            description: "Discord server ID",
+          },
+          channelId: {
+            type: "string",
+            description: "Channel ID",
+          },
+          categoryId: {
+            type: ["string", "null"],
+            description: "Category ID (null to remove from category)",
+          },
         },
-        messageId: {
-          type: "string",
-          description: "Message ID to unpin",
-        },
+        required: ["channelId", "categoryId"],
       },
-      required: ["channelId", "messageId"],
     },
-  },
-  {
-    name: "get_pinned_messages",
-    description: "Get all pinned messages in a channel",
-    inputSchema: {
-      type: "object",
-      properties: {
-        channelId: {
-          type: "string",
-          description: "Discord channel ID",
+    {
+      name: "set_category_position",
+      description: "Move a category to a specific position",
+      inputSchema: {
+        type: "object",
+        properties: {
+          guildId: {
+            type: "string",
+            description: "Discord server ID",
+          },
+          categoryId: {
+            type: "string",
+            description: "Category ID",
+          },
+          position: {
+            type: "number",
+            description: "New position (0-based)",
+          },
         },
+        required: ["categoryId", "position"],
       },
-      required: ["channelId"],
     },
-  },
-  {
-    name: "bulk_delete_messages",
-    description: "Delete multiple messages at once",
-    inputSchema: {
-      type: "object",
-      properties: {
-        channelId: {
-          type: "string",
-          description: "Discord channel ID",
-        },
-        messageIds: {
-          type: "array",
-          items: { type: "string" },
-          description: "Array of message IDs to delete",
-        },
-        filterOld: {
-          type: "boolean",
-          description: "Filter out messages older than 14 days",
-        },
-      },
-      required: ["channelId", "messageIds"],
-    },
-  },
-  {
-    name: "crosspost_message",
-    description: "Crosspost an announcement message",
-    inputSchema: {
-      type: "object",
-      properties: {
-        channelId: {
-          type: "string",
-          description: "Announcement channel ID",
-        },
-        messageId: {
-          type: "string",
-          description: "Message ID to crosspost",
-        },
-      },
-      required: ["channelId", "messageId"],
-    },
-  },
-
-  // Enhanced Member Management Tools
-  {
-    name: "get_members",
-    description: "Get server members with pagination",
-    inputSchema: {
-      type: "object",
-      properties: {
-        guildId: {
-          type: "string",
-          description: "Discord server ID",
-        },
-        limit: {
-          type: "number",
-          description: "Number of members to fetch (default 100)",
-        },
-        after: {
-          type: "string",
-          description: "User ID to fetch members after",
-        },
-      },
-      required: [],
-    },
-  },
-  {
-    name: "search_members",
-    description: "Search members by username or nickname",
-    inputSchema: {
-      type: "object",
-      properties: {
-        guildId: {
-          type: "string",
-          description: "Discord server ID",
-        },
-        query: {
-          type: "string",
-          description: "Search query (username or nickname)",
-        },
-        limit: {
-          type: "number",
-          description: "Max results to return",
-        },
-      },
-      required: ["query"],
-    },
-  },
-  {
-    name: "edit_member",
-    description: "Edit member properties like nickname and roles",
-    inputSchema: {
-      type: "object",
-      properties: {
-        guildId: {
-          type: "string",
-          description: "Discord server ID",
-        },
-        userId: {
-          type: "string",
-          description: "Discord user ID",
-        },
-        nickname: {
-          type: "string",
-          description: "New nickname",
-        },
-        roles: {
-          type: "array",
-          items: { type: "string" },
-          description: "Array of role IDs to set",
-        },
-      },
-      required: ["userId"],
-    },
-  },
-  {
-    name: "get_member_info",
-    description: "Get detailed information about a member",
-    inputSchema: {
-      type: "object",
-      properties: {
-        guildId: {
-          type: "string",
-          description: "Discord server ID",
-        },
-        userId: {
-          type: "string",
-          description: "Discord user ID",
-        },
-      },
-      required: ["userId"],
-    },
-  },
-
-  // Event & Scheduling Tools
-  {
-    name: "create_event",
-    description: "Create a scheduled Discord event",
-    inputSchema: {
-      type: "object",
-      properties: {
-        guildId: {
-          type: "string",
-          description: "Discord server ID",
-        },
-        name: {
-          type: "string",
-          description: "Event name",
-        },
-        description: {
-          type: "string",
-          description: "Event description",
-        },
-        startTime: {
-          type: "string",
-          description: "Event start time (ISO 8601 format)",
-        },
-        endTime: {
-          type: "string",
-          description: "Event end time (ISO 8601 format)",
-        },
-        location: {
-          type: "string",
-          description: "Event location for external events",
-        },
-        channelId: {
-          type: "string",
-          description: "Voice channel ID for voice events",
-        },
-      },
-      required: ["name", "startTime"],
-    },
-  },
-  {
-    name: "edit_event",
-    description: "Edit an existing scheduled event",
-    inputSchema: {
-      type: "object",
-      properties: {
-        guildId: {
-          type: "string",
-          description: "Discord server ID",
-        },
-        eventId: {
-          type: "string",
-          description: "Event ID",
-        },
-        name: {
-          type: "string",
-          description: "New event name",
-        },
-        description: {
-          type: "string",
-          description: "New event description",
-        },
-        startTime: {
-          type: "string",
-          description: "New start time (ISO 8601 format)",
-        },
-        endTime: {
-          type: "string",
-          description: "New end time (ISO 8601 format)",
-        },
-        location: {
-          type: "string",
-          description: "New event location",
-        },
-      },
-      required: ["eventId"],
-    },
-  },
-  {
-    name: "delete_event",
-    description: "Delete a scheduled event",
-    inputSchema: {
-      type: "object",
-      properties: {
-        guildId: {
-          type: "string",
-          description: "Discord server ID",
-        },
-        eventId: {
-          type: "string",
-          description: "Event ID",
-        },
-      },
-      required: ["eventId"],
-    },
-  },
-  {
-    name: "get_events",
-    description: "List all scheduled events in the server",
-    inputSchema: {
-      type: "object",
-      properties: {
-        guildId: {
-          type: "string",
-          description: "Discord server ID",
-        },
-      },
-      required: [],
-    },
-  },
-
-  // Enhanced Invite Management Tools
-  {
-    name: "create_invite",
-    description: "Create an invite link with custom settings",
-    inputSchema: {
-      type: "object",
-      properties: {
-        channelId: {
-          type: "string",
-          description: "Channel ID",
-        },
-        maxAge: {
-          type: "number",
-          description: "Invite expiration in seconds (0 = never)",
-        },
-        maxUses: {
-          type: "number",
-          description: "Maximum uses (0 = unlimited)",
-        },
-        temporary: {
-          type: "boolean",
-          description: "Grant temporary membership",
-        },
-      },
-      required: ["channelId"],
-    },
-  },
-  {
-    name: "delete_invite",
-    description: "Delete/revoke an invite",
-    inputSchema: {
-      type: "object",
-      properties: {
-        inviteCode: {
-          type: "string",
-          description: "Invite code to delete",
-        },
-      },
-      required: ["inviteCode"],
-    },
-  },
-  {
-    name: "get_invites",
-    description: "List all server invites",
-    inputSchema: {
-      type: "object",
-      properties: {
-        guildId: {
-          type: "string",
-          description: "Discord server ID",
-        },
-      },
-      required: [],
-    },
-  },
-
-  // Enhanced Emoji & Sticker Tools
-  {
-    name: "create_emoji",
-    description: "Create a custom emoji in the server",
-    inputSchema: {
-      type: "object",
-      properties: {
-        guildId: {
-          type: "string",
-          description: "Discord server ID",
-        },
-        name: {
-          type: "string",
-          description: "Emoji name",
-        },
-        imageUrl: {
-          type: "string",
-          description: "Image URL or base64 data",
-        },
-        roles: {
-          type: "array",
-          items: { type: "string" },
-          description: "Role IDs that can use this emoji",
-        },
-      },
-      required: ["name", "imageUrl"],
-    },
-  },
-  {
-    name: "delete_emoji",
-    description: "Delete a custom emoji from the server",
-    inputSchema: {
-      type: "object",
-      properties: {
-        guildId: {
-          type: "string",
-          description: "Discord server ID",
-        },
-        emojiId: {
-          type: "string",
-          description: "Emoji ID",
-        },
-      },
-      required: ["emojiId"],
-    },
-  },
-  {
-    name: "get_emojis",
-    description: "List all custom emojis in the server",
-    inputSchema: {
-      type: "object",
-      properties: {
-        guildId: {
-          type: "string",
-          description: "Discord server ID",
-        },
-      },
-      required: [],
-    },
-  },
-  {
-    name: "create_sticker",
-    description: "Create a custom sticker in the server",
-    inputSchema: {
-      type: "object",
-      properties: {
-        guildId: {
-          type: "string",
-          description: "Discord server ID",
-        },
-        name: {
-          type: "string",
-          description: "Sticker name",
-        },
-        description: {
-          type: "string",
-          description: "Sticker description",
-        },
-        tags: {
-          type: "string",
-          description: "Sticker tags",
-        },
-        imageUrl: {
-          type: "string",
-          description: "Image URL or file path",
-        },
-      },
-      required: ["name", "description", "tags", "imageUrl"],
-    },
-  },
-  {
-    name: "delete_sticker",
-    description: "Delete a custom sticker from the server",
-    inputSchema: {
-      type: "object",
-      properties: {
-        guildId: {
-          type: "string",
-          description: "Discord server ID",
-        },
-        stickerId: {
-          type: "string",
-          description: "Sticker ID",
-        },
-      },
-      required: ["stickerId"],
-    },
-  },
-  {
-    name: "get_stickers",
-    description: "List all custom stickers in the server",
-    inputSchema: {
-      type: "object",
-      properties: {
-        guildId: {
-          type: "string",
-          description: "Discord server ID",
-        },
-      },
-      required: [],
-    },
-  },
-
-  // Attachment & File Tools
-  {
-    name: "upload_file",
-    description: "Upload a file to a channel",
-    inputSchema: {
-      type: "object",
-      properties: {
-        channelId: {
-          type: "string",
-          description: "Channel ID",
-        },
-        filePath: {
-          type: "string",
-          description: "Path to file or file URL",
-        },
-        fileName: {
-          type: "string",
-          description: "Custom filename",
-        },
-        content: {
-          type: "string",
-          description: "Message content to send with file",
-        },
-      },
-      required: ["channelId", "filePath"],
-    },
-  },
-  {
-    name: "get_message_attachments",
-    description: "Get attachments from a specific message",
-    inputSchema: {
-      type: "object",
-      properties: {
-        channelId: {
-          type: "string",
-          description: "Channel ID",
-        },
-        messageId: {
-          type: "string",
-          description: "Message ID",
-        },
-      },
-      required: ["channelId", "messageId"],
-    },
-  },
-
-  {
-    name: "read_images",
-    description:
-      "Read and analyze images from Discord messages with optional metadata and content analysis",
-    inputSchema: {
-      type: "object",
-      properties: {
-        channelId: {
-          type: "string",
-          description: "Channel ID to read images from",
-        },
-        messageId: {
-          type: "string",
-          description:
-            "Specific message ID (optional - if not provided, searches recent messages)",
-        },
-        limit: {
-          type: "number",
-          description: "Number of recent messages to search for images (1-10)",
-          minimum: 1,
-          maximum: 10,
-        },
-        includeMetadata: {
-          type: "boolean",
-          description: "Include image metadata (dimensions, file size, etc.)",
-        },
-        downloadImages: {
-          type: "boolean",
-          description:
-            "Download and analyze image content (slower but more detailed)",
-        },
-      },
-      required: ["channelId"],
-    },
-  },
-
-  // Privacy Management Tools
-  {
-    name: "set_channel_private",
-    description:
-      "Make a channel private or public with role/member access control",
-    inputSchema: {
-      type: "object",
-      properties: {
-        guildId: {
-          type: "string",
-          description: "Discord server ID",
-        },
-        channelId: {
-          type: "string",
-          description: "Channel ID",
-        },
-        isPrivate: {
-          type: "boolean",
-          description:
-            "Make channel private (deny @everyone) or public (allow @everyone)",
-        },
-        allowedRoles: {
-          type: "array",
-          items: { type: "string" },
-          description: "Role IDs to grant access to private channel",
-        },
-        allowedMembers: {
-          type: "array",
-          items: { type: "string" },
-          description: "Member IDs to grant access to private channel",
-        },
-        syncToCategory: {
-          type: "boolean",
-          description: "Sync permissions with category after change",
-        },
-      },
-      required: ["channelId", "isPrivate"],
-    },
-  },
-  {
-    name: "set_category_private",
-    description:
-      "Make a category private or public with role/member access control",
-    inputSchema: {
-      type: "object",
-      properties: {
-        guildId: {
-          type: "string",
-          description: "Discord server ID",
-        },
-        categoryId: {
-          type: "string",
-          description: "Category ID",
-        },
-        isPrivate: {
-          type: "boolean",
-          description:
-            "Make category private (deny @everyone) or public (allow @everyone)",
-        },
-        allowedRoles: {
-          type: "array",
-          items: { type: "string" },
-          description: "Role IDs to grant access to private category",
-        },
-        allowedMembers: {
-          type: "array",
-          items: { type: "string" },
-          description: "Member IDs to grant access to private category",
-        },
-        applyToChannels: {
-          type: "boolean",
-          description: "Apply privacy settings to all channels in category",
-        },
-      },
-      required: ["categoryId", "isPrivate"],
-    },
-  },
-  {
-    name: "bulk_set_privacy",
-    description:
-      "Set privacy for multiple channels and categories in one operation",
-    inputSchema: {
-      type: "object",
-      properties: {
-        guildId: {
-          type: "string",
-          description: "Discord server ID",
-        },
-        targets: {
-          type: "array",
-          items: {
+    {
+      name: "organize_channels",
+      description: "Comprehensive channel and category organization tool",
+      inputSchema: {
+        type: "object",
+        properties: {
+          guildId: {
+            type: "string",
+            description: "Discord server ID",
+          },
+          organization: {
             type: "object",
             properties: {
-              id: {
-                type: "string",
-                description: "Channel or category ID",
-              },
-              type: {
-                type: "string",
-                enum: ["channel", "category"],
-                description: "Type of target",
-              },
-              isPrivate: {
-                type: "boolean",
-                description: "Make private or public",
-              },
-              allowedRoles: {
+              categories: {
                 type: "array",
-                items: { type: "string" },
-                description: "Role IDs to grant access",
+                items: {
+                  type: "object",
+                  properties: {
+                    categoryId: {
+                      type: "string",
+                      description: "Category ID",
+                    },
+                    position: {
+                      type: "number",
+                      description: "New position",
+                    },
+                  },
+                  required: ["categoryId", "position"],
+                },
+                description: "Array of category position updates",
               },
-              allowedMembers: {
+              channels: {
                 type: "array",
-                items: { type: "string" },
-                description: "Member IDs to grant access",
+                items: {
+                  type: "object",
+                  properties: {
+                    channelId: {
+                      type: "string",
+                      description: "Channel ID",
+                    },
+                    position: {
+                      type: "number",
+                      description: "New position (optional)",
+                    },
+                    categoryId: {
+                      type: ["string", "null"],
+                      description:
+                        "Category ID (null to remove from category, optional)",
+                    },
+                  },
+                  required: ["channelId"],
+                },
+                description: "Array of channel updates",
               },
             },
-            required: ["id", "type", "isPrivate"],
+            description: "Organization configuration",
           },
-          description: "Array of channels/categories to update",
         },
+        required: ["organization"],
       },
-      required: ["targets"],
     },
-  },
+    {
+      name: "get_channel_structure",
+      description:
+        "Get the current channel and category structure of the server",
+      inputSchema: {
+        type: "object",
+        properties: {
+          guildId: {
+            type: "string",
+            description: "Discord server ID",
+          },
+        },
+        required: [],
+      },
+    },
 
-  // Comprehensive Channel Management
-  {
-    name: "comprehensive_channel_management",
-    description:
-      "All-in-one channel management tool that performs multiple channel operations in sequence",
-    inputSchema: {
-      type: "object",
-      properties: {
-        guildId: {
-          type: "string",
-          description: "Discord server ID",
-        },
-        operations: {
-          type: "array",
-          items: {
-            type: "object",
-            properties: {
-              action: {
-                type: "string",
-                enum: [
-                  "create_text_channel",
-                  "create_voice_channel",
-                  "create_forum_channel",
-                  "create_announcement_channel",
-                  "create_stage_channel",
-                  "create_category",
-                  "edit_channel_advanced",
-                  "delete_channel",
-                  "delete_category",
-                  "set_channel_position",
-                  "set_category_position",
-                  "move_channel_to_category",
-                  "set_channel_private",
-                  "set_category_private",
-                ],
-                description: "Action to perform",
-              },
-              name: {
-                type: "string",
-                description: "Name for new channels/categories",
-              },
-              categoryId: {
-                type: ["string", "null"],
-                description: "Category ID for channel placement",
-              },
-              channelId: {
-                type: "string",
-                description: "Target channel ID for operations",
-              },
-              targetCategoryId: {
-                type: "string",
-                description: "Target category ID for operations",
-              },
-              topic: {
-                type: "string",
-                description: "Channel topic/description",
-              },
-              slowmode: {
-                type: "number",
-                minimum: 0,
-                maximum: 21600,
-                description: "Slowmode in seconds (0-21600)",
-              },
-              userLimit: {
-                type: "number",
-                minimum: 0,
-                maximum: 99,
-                description:
-                  "User limit for voice channels (0-99, 0 = unlimited)",
-              },
-              bitrate: {
-                type: "number",
-                minimum: 8000,
-                maximum: 384000,
-                description: "Bitrate for voice channels (8000-384000)",
-              },
-              defaultReactionEmoji: {
-                type: "string",
-                description: "Default reaction emoji for forum posts",
-              },
-              position: {
-                type: "number",
-                description: "New position for channel/category",
-              },
-              isPrivate: {
-                type: "boolean",
-                description: "Make channel/category private",
-              },
-              allowedRoles: {
-                type: "array",
-                items: { type: "string" },
-                description: "Role IDs to grant access",
-              },
-              allowedMembers: {
-                type: "array",
-                items: { type: "string" },
-                description: "Member IDs to grant access",
-              },
-              syncToCategory: {
-                type: "boolean",
-                description: "Sync permissions with category",
-              },
-              applyToChannels: {
-                type: "boolean",
-                description: "Apply category privacy to all channels",
-              },
-            },
-            required: ["action"],
+    // Additional Message Management Tools
+    {
+      name: "pin_message",
+      description: "Pin a message in a channel",
+      inputSchema: {
+        type: "object",
+        properties: {
+          channelId: {
+            type: "string",
+            description: "Discord channel ID",
           },
-          description: "Array of operations to perform in sequence",
+          messageId: {
+            type: "string",
+            description: "Message ID to pin",
+          },
         },
+        required: ["channelId", "messageId"],
       },
-      required: ["operations"],
     },
-  },
+    {
+      name: "unpin_message",
+      description: "Unpin a message in a channel",
+      inputSchema: {
+        type: "object",
+        properties: {
+          channelId: {
+            type: "string",
+            description: "Discord channel ID",
+          },
+          messageId: {
+            type: "string",
+            description: "Message ID to unpin",
+          },
+        },
+        required: ["channelId", "messageId"],
+      },
+    },
+    {
+      name: "get_pinned_messages",
+      description: "Get all pinned messages in a channel",
+      inputSchema: {
+        type: "object",
+        properties: {
+          channelId: {
+            type: "string",
+            description: "Discord channel ID",
+          },
+        },
+        required: ["channelId"],
+      },
+    },
+    {
+      name: "bulk_delete_messages",
+      description:
+        "Delete specific messages by ID (does not auto-select messages)",
+      inputSchema: {
+        type: "object",
+        properties: {
+          channelId: {
+            type: "string",
+            description: "Discord channel ID",
+          },
+          messageIds: {
+            type: "array",
+            items: { type: "string" },
+            description:
+              "Array of message IDs to delete (required; provide explicit IDs)",
+          },
+          filterOld: {
+            type: "boolean",
+            description: "Filter out messages older than 14 days",
+          },
+        },
+        required: ["channelId", "messageIds"],
+      },
+    },
+    {
+      name: "crosspost_message",
+      description: "Crosspost an announcement message",
+      inputSchema: {
+        type: "object",
+        properties: {
+          channelId: {
+            type: "string",
+            description: "Announcement channel ID",
+          },
+          messageId: {
+            type: "string",
+            description: "Message ID to crosspost",
+          },
+        },
+        required: ["channelId", "messageId"],
+      },
+    },
 
-  // Enhanced Automod Tools
-  {
-    name: "create_automod_rule",
-    description: "Create an automoderation rule",
-    inputSchema: {
-      type: "object",
-      properties: {
-        guildId: {
-          type: "string",
-          description: "Discord server ID",
+    // Enhanced Member Management Tools
+    {
+      name: "get_members",
+      description: "Get server members with pagination",
+      inputSchema: {
+        type: "object",
+        properties: {
+          guildId: {
+            type: "string",
+            description: "Discord server ID",
+          },
+          limit: {
+            type: "number",
+            description: "Number of members to fetch (default 100)",
+          },
+          after: {
+            type: "string",
+            description: "User ID to fetch members after",
+          },
         },
-        name: {
-          type: "string",
-          description: "Rule name",
-        },
-        eventType: {
-          type: "string",
-          enum: ["MESSAGE_SEND"],
-          description: "Event type to trigger on",
-        },
-        triggerType: {
-          type: "string",
-          enum: ["KEYWORD", "SPAM", "KEYWORD_PRESET", "MENTION_SPAM"],
-          description: "Trigger type",
-        },
-        keywordFilter: {
-          type: "array",
-          items: { type: "string" },
-          description: "Keywords to filter",
-        },
-        presets: {
-          type: "array",
-          items: { type: "string" },
-          description: "Preset keyword lists",
-        },
-        allowList: {
-          type: "array",
-          items: { type: "string" },
-          description: "Allowed words",
-        },
-        mentionLimit: {
-          type: "number",
-          description: "Max mentions allowed",
-        },
-        enabled: {
-          type: "boolean",
-          description: "Whether rule is enabled",
-        },
+        required: [],
       },
-      required: ["name", "eventType", "triggerType"],
     },
-  },
-  {
-    name: "edit_automod_rule",
-    description: "Edit an existing automoderation rule",
-    inputSchema: {
-      type: "object",
-      properties: {
-        guildId: {
-          type: "string",
-          description: "Discord server ID",
+    {
+      name: "search_members",
+      description: "Search members by username or nickname",
+      inputSchema: {
+        type: "object",
+        properties: {
+          guildId: {
+            type: "string",
+            description: "Discord server ID",
+          },
+          query: {
+            type: "string",
+            description: "Search query (username or nickname)",
+          },
+          limit: {
+            type: "number",
+            description: "Max results to return",
+          },
         },
-        ruleId: {
-          type: "string",
-          description: "Automod rule ID",
-        },
-        name: {
-          type: "string",
-          description: "New rule name",
-        },
-        enabled: {
-          type: "boolean",
-          description: "Whether rule is enabled",
-        },
-        keywordFilter: {
-          type: "array",
-          items: { type: "string" },
-          description: "Keywords to filter",
-        },
-        allowList: {
-          type: "array",
-          items: { type: "string" },
-          description: "Allowed words",
-        },
-        mentionLimit: {
-          type: "number",
-          description: "Max mentions allowed",
-        },
+        required: ["query"],
       },
-      required: ["ruleId"],
     },
-  },
-  {
-    name: "delete_automod_rule",
-    description: "Delete an automoderation rule",
-    inputSchema: {
-      type: "object",
-      properties: {
-        guildId: {
-          type: "string",
-          description: "Discord server ID",
+    {
+      name: "edit_member",
+      description: "Edit member properties like nickname and roles",
+      inputSchema: {
+        type: "object",
+        properties: {
+          guildId: {
+            type: "string",
+            description: "Discord server ID",
+          },
+          userId: {
+            type: "string",
+            description: "Discord user ID",
+          },
+          nickname: {
+            type: "string",
+            description: "New nickname",
+          },
+          roles: {
+            type: "array",
+            items: { type: "string" },
+            description: "Array of role IDs to set",
+          },
         },
-        ruleId: {
-          type: "string",
-          description: "Automod rule ID",
-        },
+        required: ["userId"],
       },
-      required: ["ruleId"],
     },
-  },
-  {
-    name: "get_automod_rules",
-    description: "List all automoderation rules in the server",
-    inputSchema: {
-      type: "object",
-      properties: {
-        guildId: {
-          type: "string",
-          description: "Discord server ID",
+    {
+      name: "get_member_info",
+      description: "Get detailed information about a member",
+      inputSchema: {
+        type: "object",
+        properties: {
+          guildId: {
+            type: "string",
+            description: "Discord server ID",
+          },
+          userId: {
+            type: "string",
+            description: "Discord user ID",
+          },
         },
+        required: ["userId"],
       },
-      required: [],
     },
-  },
 
-  // Advanced Interaction Tools
-  {
-    name: "send_modal",
-    description: "Send a modal dialog (requires active interaction context)",
-    inputSchema: {
-      type: "object",
-      properties: {
-        interactionId: {
-          type: "string",
-          description: "Interaction ID",
-        },
-        title: {
-          type: "string",
-          description: "Modal title",
-        },
-        customId: {
-          type: "string",
-          description: "Custom ID for the modal",
-        },
-        components: {
-          type: "array",
-          items: {
-            type: "object",
-            properties: {
-              type: { type: "number", description: "Component type" },
-              label: { type: "string", description: "Component label" },
-              style: { type: "number", description: "Component style" },
-              placeholder: { type: "string", description: "Placeholder text" },
-              required: {
-                type: "boolean",
-                description: "Whether field is required",
-              },
-            },
+    // Event & Scheduling Tools
+    {
+      name: "create_event",
+      description: "Create a scheduled Discord event",
+      inputSchema: {
+        type: "object",
+        properties: {
+          guildId: {
+            type: "string",
+            description: "Discord server ID",
           },
-          description: "Modal components",
-        },
-      },
-      required: ["interactionId", "title", "customId", "components"],
-    },
-  },
-  {
-    name: "send_embed",
-    description: "Send a rich embed message to a channel",
-    inputSchema: {
-      type: "object",
-      properties: {
-        channelId: {
-          type: "string",
-          description: "Channel ID",
-        },
-        title: {
-          type: "string",
-          description: "Embed title",
-        },
-        description: {
-          type: "string",
-          description: "Embed description",
-        },
-        color: {
-          type: "string",
-          description: "Embed color (hex)",
-        },
-        fields: {
-          type: "array",
-          items: {
-            type: "object",
-            properties: {
-              name: { type: "string", description: "Field name" },
-              value: { type: "string", description: "Field value" },
-              inline: {
-                type: "boolean",
-                description: "Whether field is inline",
-              },
-            },
+          name: {
+            type: "string",
+            description: "Event name",
           },
-          description: "Embed fields",
-        },
-        footer: {
-          type: "string",
-          description: "Footer text",
-        },
-        image: {
-          type: "string",
-          description: "Image URL",
-        },
-        thumbnail: {
-          type: "string",
-          description: "Thumbnail URL",
-        },
-      },
-      required: ["channelId"],
-    },
-  },
-  {
-    name: "send_button",
-    description: "Send a message with interactive buttons",
-    inputSchema: {
-      type: "object",
-      properties: {
-        channelId: {
-          type: "string",
-          description: "Channel ID",
-        },
-        content: {
-          type: "string",
-          description: "Message content",
-        },
-        buttons: {
-          type: "array",
-          items: {
-            type: "object",
-            properties: {
-              label: { type: "string", description: "Button label" },
-              style: {
-                type: "string",
-                enum: ["PRIMARY", "SECONDARY", "SUCCESS", "DANGER", "LINK"],
-                description: "Button style",
-              },
-              customId: {
-                type: "string",
-                description: "Custom ID for the button",
-              },
-              url: { type: "string", description: "URL for link buttons" },
-              emoji: { type: "string", description: "Button emoji" },
-            },
+          description: {
+            type: "string",
+            description: "Event description",
           },
-          description: "Button components",
-        },
-      },
-      required: ["channelId", "buttons"],
-    },
-  },
-  {
-    name: "send_select_menu",
-    description: "Send a message with a select menu",
-    inputSchema: {
-      type: "object",
-      properties: {
-        channelId: {
-          type: "string",
-          description: "Channel ID",
-        },
-        content: {
-          type: "string",
-          description: "Message content",
-        },
-        customId: {
-          type: "string",
-          description: "Custom ID for the select menu",
-        },
-        placeholder: {
-          type: "string",
-          description: "Placeholder text",
-        },
-        minValues: {
-          type: "number",
-          description: "Minimum values to select",
-        },
-        maxValues: {
-          type: "number",
-          description: "Maximum values to select",
-        },
-        options: {
-          type: "array",
-          items: {
-            type: "object",
-            properties: {
-              label: { type: "string", description: "Option label" },
-              value: { type: "string", description: "Option value" },
-              description: {
-                type: "string",
-                description: "Option description",
-              },
-              emoji: { type: "string", description: "Option emoji" },
-            },
+          startTime: {
+            type: "string",
+            description: "Event start time (ISO 8601 format)",
           },
-          description: "Select menu options",
+          endTime: {
+            type: "string",
+            description: "Event end time (ISO 8601 format)",
+          },
+          location: {
+            type: "string",
+            description: "Event location for external events",
+          },
+          channelId: {
+            type: "string",
+            description: "Voice channel ID for voice events",
+          },
         },
+        required: ["name", "startTime"],
       },
-      required: ["channelId", "options"],
     },
-  },
+    {
+      name: "edit_event",
+      description: "Edit an existing scheduled event",
+      inputSchema: {
+        type: "object",
+        properties: {
+          guildId: {
+            type: "string",
+            description: "Discord server ID",
+          },
+          eventId: {
+            type: "string",
+            description: "Event ID",
+          },
+          name: {
+            type: "string",
+            description: "New event name",
+          },
+          description: {
+            type: "string",
+            description: "New event description",
+          },
+          startTime: {
+            type: "string",
+            description: "New start time (ISO 8601 format)",
+          },
+          endTime: {
+            type: "string",
+            description: "New end time (ISO 8601 format)",
+          },
+          location: {
+            type: "string",
+            description: "New event location",
+          },
+        },
+        required: ["eventId"],
+      },
+    },
+    {
+      name: "delete_event",
+      description: "Delete a scheduled event",
+      inputSchema: {
+        type: "object",
+        properties: {
+          guildId: {
+            type: "string",
+            description: "Discord server ID",
+          },
+          eventId: {
+            type: "string",
+            description: "Event ID",
+          },
+        },
+        required: ["eventId"],
+      },
+    },
+    {
+      name: "get_events",
+      description: "List all scheduled events in the server",
+      inputSchema: {
+        type: "object",
+        properties: {
+          guildId: {
+            type: "string",
+            description: "Discord server ID",
+          },
+        },
+        required: [],
+      },
+    },
 
-  // Enhanced Server Management Tools
-  {
-    name: "edit_server",
-    description:
-      "Edit server settings like name, description, and verification level",
-    inputSchema: {
-      type: "object",
-      properties: {
-        guildId: {
-          type: "string",
-          description: "Discord server ID",
+    // Enhanced Invite Management Tools
+    {
+      name: "create_invite",
+      description: "Create an invite link with custom settings",
+      inputSchema: {
+        type: "object",
+        properties: {
+          channelId: {
+            type: "string",
+            description: "Channel ID",
+          },
+          maxAge: {
+            type: "number",
+            description: "Invite expiration in seconds (0 = never)",
+          },
+          maxUses: {
+            type: "number",
+            description: "Maximum uses (0 = unlimited)",
+          },
+          temporary: {
+            type: "boolean",
+            description: "Grant temporary membership",
+          },
         },
-        name: {
-          type: "string",
-          description: "New server name",
-        },
-        description: {
-          type: "string",
-          description: "New server description",
-        },
-        icon: {
-          type: "string",
-          description: "New server icon URL",
-        },
-        banner: {
-          type: "string",
-          description: "New server banner URL",
-        },
-        verificationLevel: {
-          type: "string",
-          enum: ["NONE", "LOW", "MEDIUM", "HIGH", "VERY_HIGH"],
-          description: "Verification level",
-        },
+        required: ["channelId"],
       },
-      required: [],
     },
-  },
-  {
-    name: "get_server_widget",
-    description: "Get server widget information",
-    inputSchema: {
-      type: "object",
-      properties: {
-        guildId: {
-          type: "string",
-          description: "Discord server ID",
+    {
+      name: "delete_invite",
+      description: "Delete/revoke an invite",
+      inputSchema: {
+        type: "object",
+        properties: {
+          inviteCode: {
+            type: "string",
+            description: "Invite code to delete",
+          },
         },
+        required: ["inviteCode"],
       },
-      required: [],
     },
-  },
-  {
-    name: "get_welcome_screen",
-    description: "Get server welcome screen information",
-    inputSchema: {
-      type: "object",
-      properties: {
-        guildId: {
-          type: "string",
-          description: "Discord server ID",
+    {
+      name: "get_invites",
+      description: "List all server invites",
+      inputSchema: {
+        type: "object",
+        properties: {
+          guildId: {
+            type: "string",
+            description: "Discord server ID",
+          },
         },
+        required: [],
       },
-      required: [],
     },
-  },
-  {
-    name: "edit_welcome_screen",
-    description: "Edit server welcome screen settings",
-    inputSchema: {
-      type: "object",
-      properties: {
-        guildId: {
-          type: "string",
-          description: "Discord server ID",
+
+    // Enhanced Emoji & Sticker Tools
+    {
+      name: "create_emoji",
+      description: "Create a custom emoji in the server",
+      inputSchema: {
+        type: "object",
+        properties: {
+          guildId: {
+            type: "string",
+            description: "Discord server ID",
+          },
+          name: {
+            type: "string",
+            description: "Emoji name",
+          },
+          imageUrl: {
+            type: "string",
+            description: "Image URL or base64 data",
+          },
+          roles: {
+            type: "array",
+            items: { type: "string" },
+            description: "Role IDs that can use this emoji",
+          },
         },
-        enabled: {
-          type: "boolean",
-          description: "Whether welcome screen is enabled",
+        required: ["name", "imageUrl"],
+      },
+    },
+    {
+      name: "delete_emoji",
+      description: "Delete a custom emoji from the server",
+      inputSchema: {
+        type: "object",
+        properties: {
+          guildId: {
+            type: "string",
+            description: "Discord server ID",
+          },
+          emojiId: {
+            type: "string",
+            description: "Emoji ID",
+          },
         },
-        description: {
-          type: "string",
-          description: "Welcome screen description",
+        required: ["emojiId"],
+      },
+    },
+    {
+      name: "get_emojis",
+      description: "List all custom emojis in the server",
+      inputSchema: {
+        type: "object",
+        properties: {
+          guildId: {
+            type: "string",
+            description: "Discord server ID",
+          },
         },
-        welcomeChannels: {
-          type: "array",
-          items: {
+        required: [],
+      },
+    },
+    {
+      name: "create_sticker",
+      description: "Create a custom sticker in the server",
+      inputSchema: {
+        type: "object",
+        properties: {
+          guildId: {
+            type: "string",
+            description: "Discord server ID",
+          },
+          name: {
+            type: "string",
+            description: "Sticker name",
+          },
+          description: {
+            type: "string",
+            description: "Sticker description",
+          },
+          tags: {
+            type: "string",
+            description: "Sticker tags",
+          },
+          imageUrl: {
+            type: "string",
+            description: "Image URL or file path",
+          },
+        },
+        required: ["name", "description", "tags", "imageUrl"],
+      },
+    },
+    {
+      name: "delete_sticker",
+      description: "Delete a custom sticker from the server",
+      inputSchema: {
+        type: "object",
+        properties: {
+          guildId: {
+            type: "string",
+            description: "Discord server ID",
+          },
+          stickerId: {
+            type: "string",
+            description: "Sticker ID",
+          },
+        },
+        required: ["stickerId"],
+      },
+    },
+    {
+      name: "get_stickers",
+      description: "List all custom stickers in the server",
+      inputSchema: {
+        type: "object",
+        properties: {
+          guildId: {
+            type: "string",
+            description: "Discord server ID",
+          },
+        },
+        required: [],
+      },
+    },
+
+    // Attachment & File Tools
+    {
+      name: "upload_file",
+      description: "Upload a file to a channel",
+      inputSchema: {
+        type: "object",
+        properties: {
+          channelId: {
+            type: "string",
+            description: "Channel ID",
+          },
+          filePath: {
+            type: "string",
+            description: "Path to file or file URL",
+          },
+          fileName: {
+            type: "string",
+            description: "Custom filename",
+          },
+          content: {
+            type: "string",
+            description: "Message content to send with file",
+          },
+        },
+        required: ["channelId", "filePath"],
+      },
+    },
+    {
+      name: "get_message_attachments",
+      description: "Get attachments from a specific message",
+      inputSchema: {
+        type: "object",
+        properties: {
+          channelId: {
+            type: "string",
+            description: "Channel ID",
+          },
+          messageId: {
+            type: "string",
+            description: "Message ID",
+          },
+        },
+        required: ["channelId", "messageId"],
+      },
+    },
+
+    {
+      name: "read_images",
+      description:
+        "Read and analyze images from Discord messages with optional metadata and content analysis",
+      inputSchema: {
+        type: "object",
+        properties: {
+          channelId: {
+            type: "string",
+            description: "Channel ID to read images from",
+          },
+          messageId: {
+            type: "string",
+            description:
+              "Specific message ID (optional - if not provided, searches recent messages)",
+          },
+          limit: {
+            type: "number",
+            description:
+              "Number of recent messages to search for images (1-10)",
+            minimum: 1,
+            maximum: 10,
+          },
+          includeMetadata: {
+            type: "boolean",
+            description: "Include image metadata (dimensions, file size, etc.)",
+          },
+          downloadImages: {
+            type: "boolean",
+            description:
+              "Download and analyze image content (slower but more detailed)",
+          },
+        },
+        required: ["channelId"],
+      },
+    },
+
+    // Privacy Management Tools
+    {
+      name: "set_channel_private",
+      description:
+        "Make a channel private or public with role/member access control",
+      inputSchema: {
+        type: "object",
+        properties: {
+          guildId: {
+            type: "string",
+            description: "Discord server ID",
+          },
+          channelId: {
+            type: "string",
+            description: "Channel ID",
+          },
+          isPrivate: {
+            type: "boolean",
+            description:
+              "Make channel private (deny @everyone) or public (allow @everyone)",
+          },
+          allowedRoles: {
+            type: "array",
+            items: { type: "string" },
+            description: "Role IDs to grant access to private channel",
+          },
+          allowedMembers: {
+            type: "array",
+            items: { type: "string" },
+            description: "Member IDs to grant access to private channel",
+          },
+          syncToCategory: {
+            type: "boolean",
+            description: "Sync permissions with category after change",
+          },
+        },
+        required: ["channelId", "isPrivate"],
+      },
+    },
+    {
+      name: "set_category_private",
+      description:
+        "Make a category private or public with role/member access control",
+      inputSchema: {
+        type: "object",
+        properties: {
+          guildId: {
+            type: "string",
+            description: "Discord server ID",
+          },
+          categoryId: {
+            type: "string",
+            description: "Category ID",
+          },
+          isPrivate: {
+            type: "boolean",
+            description:
+              "Make category private (deny @everyone) or public (allow @everyone)",
+          },
+          allowedRoles: {
+            type: "array",
+            items: { type: "string" },
+            description: "Role IDs to grant access to private category",
+          },
+          allowedMembers: {
+            type: "array",
+            items: { type: "string" },
+            description: "Member IDs to grant access to private category",
+          },
+          applyToChannels: {
+            type: "boolean",
+            description: "Apply privacy settings to all channels in category",
+          },
+        },
+        required: ["categoryId", "isPrivate"],
+      },
+    },
+    {
+      name: "bulk_set_privacy",
+      description:
+        "Set privacy for multiple channels and categories in one operation",
+      inputSchema: {
+        type: "object",
+        properties: {
+          guildId: {
+            type: "string",
+            description: "Discord server ID",
+          },
+          targets: {
+            type: "array",
+            items: {
+              type: "object",
+              properties: {
+                id: {
+                  type: "string",
+                  description: "Channel or category ID",
+                },
+                type: {
+                  type: "string",
+                  enum: ["channel", "category"],
+                  description: "Type of target",
+                },
+                isPrivate: {
+                  type: "boolean",
+                  description: "Make private or public",
+                },
+                allowedRoles: {
+                  type: "array",
+                  items: { type: "string" },
+                  description: "Role IDs to grant access",
+                },
+                allowedMembers: {
+                  type: "array",
+                  items: { type: "string" },
+                  description: "Member IDs to grant access",
+                },
+              },
+              required: ["id", "type", "isPrivate"],
+            },
+            description: "Array of channels/categories to update",
+          },
+        },
+        required: ["targets"],
+      },
+    },
+
+    // Comprehensive Channel Management
+    {
+      name: "comprehensive_channel_management",
+      description:
+        "All-in-one channel management tool that performs multiple channel operations in sequence",
+      inputSchema: {
+        type: "object",
+        properties: {
+          guildId: {
+            type: "string",
+            description: "Discord server ID",
+          },
+          operations: {
+            type: "array",
+            items: {
+              type: "object",
+              properties: {
+                action: {
+                  type: "string",
+                  enum: [
+                    "create_text_channel",
+                    "create_voice_channel",
+                    "create_forum_channel",
+                    "create_announcement_channel",
+                    "create_stage_channel",
+                    "create_category",
+                    "edit_channel_advanced",
+                    "delete_channel",
+                    "delete_category",
+                    "set_channel_position",
+                    "set_category_position",
+                    "move_channel_to_category",
+                    "set_channel_private",
+                    "set_category_private",
+                  ],
+                  description: "Action to perform",
+                },
+                name: {
+                  type: "string",
+                  description: "Name for new channels/categories",
+                },
+                categoryId: {
+                  type: ["string", "null"],
+                  description: "Category ID for channel placement",
+                },
+                channelId: {
+                  type: "string",
+                  description: "Target channel ID for operations",
+                },
+                targetCategoryId: {
+                  type: "string",
+                  description: "Target category ID for operations",
+                },
+                topic: {
+                  type: "string",
+                  description: "Channel topic/description",
+                },
+                slowmode: {
+                  type: "number",
+                  minimum: 0,
+                  maximum: 21600,
+                  description: "Slowmode in seconds (0-21600)",
+                },
+                userLimit: {
+                  type: "number",
+                  minimum: 0,
+                  maximum: 99,
+                  description:
+                    "User limit for voice channels (0-99, 0 = unlimited)",
+                },
+                bitrate: {
+                  type: "number",
+                  minimum: 8000,
+                  maximum: 384000,
+                  description: "Bitrate for voice channels (8000-384000)",
+                },
+                defaultReactionEmoji: {
+                  type: "string",
+                  description: "Default reaction emoji for forum posts",
+                },
+                position: {
+                  type: "number",
+                  description: "New position for channel/category",
+                },
+                isPrivate: {
+                  type: "boolean",
+                  description: "Make channel/category private",
+                },
+                allowedRoles: {
+                  type: "array",
+                  items: { type: "string" },
+                  description: "Role IDs to grant access",
+                },
+                allowedMembers: {
+                  type: "array",
+                  items: { type: "string" },
+                  description: "Member IDs to grant access",
+                },
+                syncToCategory: {
+                  type: "boolean",
+                  description: "Sync permissions with category",
+                },
+                applyToChannels: {
+                  type: "boolean",
+                  description: "Apply category privacy to all channels",
+                },
+              },
+              required: ["action"],
+            },
+            description: "Array of operations to perform in sequence",
+          },
+        },
+        required: ["operations"],
+      },
+    },
+
+    // Enhanced Automod Tools
+    {
+      name: "create_automod_rule",
+      description: "Create an automoderation rule",
+      inputSchema: {
+        type: "object",
+        properties: {
+          guildId: {
+            type: "string",
+            description: "Discord server ID",
+          },
+          name: {
+            type: "string",
+            description: "Rule name",
+          },
+          eventType: {
+            type: "string",
+            enum: ["MESSAGE_SEND"],
+            description: "Event type to trigger on",
+          },
+          triggerType: {
+            type: "string",
+            enum: ["KEYWORD", "SPAM", "KEYWORD_PRESET", "MENTION_SPAM"],
+            description: "Trigger type",
+          },
+          keywordFilter: {
+            type: "array",
+            items: { type: "string" },
+            description: "Keywords to filter",
+          },
+          presets: {
+            type: "array",
+            items: { type: "string" },
+            description: "Preset keyword lists",
+          },
+          allowList: {
+            type: "array",
+            items: { type: "string" },
+            description: "Allowed words",
+          },
+          mentionLimit: {
+            type: "number",
+            description: "Max mentions allowed",
+          },
+          enabled: {
+            type: "boolean",
+            description: "Whether rule is enabled",
+          },
+        },
+        required: ["name", "eventType", "triggerType"],
+      },
+    },
+    {
+      name: "edit_automod_rule",
+      description: "Edit an existing automoderation rule",
+      inputSchema: {
+        type: "object",
+        properties: {
+          guildId: {
+            type: "string",
+            description: "Discord server ID",
+          },
+          ruleId: {
+            type: "string",
+            description: "Automod rule ID",
+          },
+          name: {
+            type: "string",
+            description: "New rule name",
+          },
+          enabled: {
+            type: "boolean",
+            description: "Whether rule is enabled",
+          },
+          keywordFilter: {
+            type: "array",
+            items: { type: "string" },
+            description: "Keywords to filter",
+          },
+          allowList: {
+            type: "array",
+            items: { type: "string" },
+            description: "Allowed words",
+          },
+          mentionLimit: {
+            type: "number",
+            description: "Max mentions allowed",
+          },
+        },
+        required: ["ruleId"],
+      },
+    },
+    {
+      name: "delete_automod_rule",
+      description: "Delete an automoderation rule",
+      inputSchema: {
+        type: "object",
+        properties: {
+          guildId: {
+            type: "string",
+            description: "Discord server ID",
+          },
+          ruleId: {
+            type: "string",
+            description: "Automod rule ID",
+          },
+        },
+        required: ["ruleId"],
+      },
+    },
+    {
+      name: "get_automod_rules",
+      description: "List all automoderation rules in the server",
+      inputSchema: {
+        type: "object",
+        properties: {
+          guildId: {
+            type: "string",
+            description: "Discord server ID",
+          },
+        },
+        required: [],
+      },
+    },
+
+    // Advanced Interaction Tools
+    {
+      name: "send_modal",
+      description: "Send a modal dialog (requires active interaction context)",
+      inputSchema: {
+        type: "object",
+        properties: {
+          interactionId: {
+            type: "string",
+            description: "Interaction ID",
+          },
+          title: {
+            type: "string",
+            description: "Modal title",
+          },
+          customId: {
+            type: "string",
+            description: "Custom ID for the modal",
+          },
+          components: {
+            type: "array",
+            items: {
+              type: "object",
+              properties: {
+                type: { type: "number", description: "Component type" },
+                label: { type: "string", description: "Component label" },
+                style: { type: "number", description: "Component style" },
+                placeholder: {
+                  type: "string",
+                  description: "Placeholder text",
+                },
+                required: {
+                  type: "boolean",
+                  description: "Whether field is required",
+                },
+              },
+            },
+            description: "Modal components",
+          },
+        },
+        required: ["interactionId", "title", "customId", "components"],
+      },
+    },
+    {
+      name: "send_embed",
+      description: "Send a rich embed message to a channel",
+      inputSchema: {
+        type: "object",
+        properties: {
+          channelId: {
+            type: "string",
+            description: "Channel ID",
+          },
+          title: {
+            type: "string",
+            description: "Embed title",
+          },
+          description: {
+            type: "string",
+            description: "Embed description",
+          },
+          color: {
+            type: "string",
+            description: "Embed color (hex)",
+          },
+          fields: {
+            type: "array",
+            items: {
+              type: "object",
+              properties: {
+                name: { type: "string", description: "Field name" },
+                value: { type: "string", description: "Field value" },
+                inline: {
+                  type: "boolean",
+                  description: "Whether field is inline",
+                },
+              },
+            },
+            description: "Embed fields",
+          },
+          footer: {
+            type: "string",
+            description: "Footer text",
+          },
+          image: {
+            type: "string",
+            description: "Image URL",
+          },
+          thumbnail: {
+            type: "string",
+            description: "Thumbnail URL",
+          },
+        },
+        required: ["channelId"],
+      },
+    },
+    {
+      name: "send_button",
+      description: "Send a message with interactive buttons",
+      inputSchema: {
+        type: "object",
+        properties: {
+          channelId: {
+            type: "string",
+            description: "Channel ID",
+          },
+          content: {
+            type: "string",
+            description: "Message content",
+          },
+          buttons: {
+            type: "array",
+            items: {
+              type: "object",
+              properties: {
+                label: { type: "string", description: "Button label" },
+                style: {
+                  type: "string",
+                  enum: ["PRIMARY", "SECONDARY", "SUCCESS", "DANGER", "LINK"],
+                  description: "Button style",
+                },
+                customId: {
+                  type: "string",
+                  description: "Custom ID for the button",
+                },
+                url: { type: "string", description: "URL for link buttons" },
+                emoji: { type: "string", description: "Button emoji" },
+              },
+            },
+            description: "Button components",
+          },
+        },
+        required: ["channelId", "buttons"],
+      },
+    },
+    {
+      name: "send_select_menu",
+      description: "Send a message with a select menu",
+      inputSchema: {
+        type: "object",
+        properties: {
+          channelId: {
+            type: "string",
+            description: "Channel ID",
+          },
+          content: {
+            type: "string",
+            description: "Message content",
+          },
+          customId: {
+            type: "string",
+            description: "Custom ID for the select menu",
+          },
+          placeholder: {
+            type: "string",
+            description: "Placeholder text",
+          },
+          minValues: {
+            type: "number",
+            description: "Minimum values to select",
+          },
+          maxValues: {
+            type: "number",
+            description: "Maximum values to select",
+          },
+          options: {
+            type: "array",
+            items: {
+              type: "object",
+              properties: {
+                label: { type: "string", description: "Option label" },
+                value: { type: "string", description: "Option value" },
+                description: {
+                  type: "string",
+                  description: "Option description",
+                },
+                emoji: { type: "string", description: "Option emoji" },
+              },
+            },
+            description: "Select menu options",
+          },
+        },
+        required: ["channelId", "options"],
+      },
+    },
+
+    // Enhanced Server Management Tools
+    {
+      name: "edit_server",
+      description:
+        "Edit server settings like name, description, and verification level",
+      inputSchema: {
+        type: "object",
+        properties: {
+          guildId: {
+            type: "string",
+            description: "Discord server ID",
+          },
+          name: {
+            type: "string",
+            description: "New server name",
+          },
+          description: {
+            type: "string",
+            description: "New server description",
+          },
+          icon: {
+            type: "string",
+            description: "New server icon URL",
+          },
+          banner: {
+            type: "string",
+            description: "New server banner URL",
+          },
+          verificationLevel: {
+            type: "string",
+            enum: ["NONE", "LOW", "MEDIUM", "HIGH", "VERY_HIGH"],
+            description: "Verification level",
+          },
+        },
+        required: [],
+      },
+    },
+    {
+      name: "get_server_widget",
+      description: "Get server widget information",
+      inputSchema: {
+        type: "object",
+        properties: {
+          guildId: {
+            type: "string",
+            description: "Discord server ID",
+          },
+        },
+        required: [],
+      },
+    },
+    {
+      name: "get_welcome_screen",
+      description: "Get server welcome screen information",
+      inputSchema: {
+        type: "object",
+        properties: {
+          guildId: {
+            type: "string",
+            description: "Discord server ID",
+          },
+        },
+        required: [],
+      },
+    },
+    {
+      name: "edit_welcome_screen",
+      description: "Edit server welcome screen settings",
+      inputSchema: {
+        type: "object",
+        properties: {
+          guildId: {
+            type: "string",
+            description: "Discord server ID",
+          },
+          enabled: {
+            type: "boolean",
+            description: "Whether welcome screen is enabled",
+          },
+          description: {
+            type: "string",
+            description: "Welcome screen description",
+          },
+          welcomeChannels: {
+            type: "array",
+            items: {
+              type: "object",
+              properties: {
+                channelId: { type: "string", description: "Channel ID" },
+                description: {
+                  type: "string",
+                  description: "Channel description",
+                },
+                emoji: { type: "string", description: "Channel emoji" },
+              },
+            },
+            description: "Welcome screen channels",
+          },
+        },
+        required: [],
+      },
+    },
+
+    // Analytics & Logging Enhanced Tools
+    {
+      name: "get_message_history",
+      description: "Get message history from a channel with pagination",
+      inputSchema: {
+        type: "object",
+        properties: {
+          channelId: {
+            type: "string",
+            description: "Channel ID",
+          },
+          limit: {
+            type: "number",
+            description: "Number of messages to retrieve (max 100)",
+          },
+          before: {
+            type: "string",
+            description: "Message ID to fetch before",
+          },
+          after: {
+            type: "string",
+            description: "Message ID to fetch after",
+          },
+        },
+        required: ["channelId"],
+      },
+    },
+    {
+      name: "get_server_stats",
+      description: "Get comprehensive server statistics",
+      inputSchema: {
+        type: "object",
+        properties: {
+          guildId: {
+            type: "string",
+            description: "Discord server ID",
+          },
+        },
+        required: [],
+      },
+    },
+    {
+      name: "export_chat_log",
+      description: "Export chat messages in various formats",
+      inputSchema: {
+        type: "object",
+        properties: {
+          channelId: {
+            type: "string",
+            description: "Channel ID",
+          },
+          format: {
+            type: "string",
+            enum: ["JSON", "CSV", "TXT"],
+            description: "Export format",
+          },
+          limit: {
+            type: "number",
+            description:
+              "Number of messages to export (supports >100 via pagination)",
+          },
+          dateRange: {
             type: "object",
             properties: {
-              channelId: { type: "string", description: "Channel ID" },
-              description: {
-                type: "string",
-                description: "Channel description",
-              },
-              emoji: { type: "string", description: "Channel emoji" },
+              start: { type: "string", description: "Start date (ISO 8601)" },
+              end: { type: "string", description: "End date (ISO 8601)" },
             },
+            description: "Date range filter",
           },
-          description: "Welcome screen channels",
         },
+        required: ["channelId", "format"],
       },
-      required: [],
     },
-  },
+  ];
 
-  // Analytics & Logging Enhanced Tools
-  {
-    name: "get_message_history",
-    description: "Get message history from a channel with pagination",
-    inputSchema: {
-      type: "object",
-      properties: {
-        channelId: {
-          type: "string",
-          description: "Channel ID",
-        },
-        limit: {
-          type: "number",
-          description: "Number of messages to retrieve",
-        },
-        before: {
-          type: "string",
-          description: "Message ID to fetch before",
-        },
-        after: {
-          type: "string",
-          description: "Message ID to fetch after",
-        },
-      },
-      required: ["channelId"],
-    },
-  },
-  {
-    name: "get_server_stats",
-    description: "Get comprehensive server statistics",
-    inputSchema: {
-      type: "object",
-      properties: {
-        guildId: {
-          type: "string",
-          description: "Discord server ID",
-        },
-      },
-      required: [],
-    },
-  },
-  {
-    name: "export_chat_log",
-    description: "Export chat messages in various formats",
-    inputSchema: {
-      type: "object",
-      properties: {
-        channelId: {
-          type: "string",
-          description: "Channel ID",
-        },
-        format: {
-          type: "string",
-          enum: ["JSON", "CSV", "TXT"],
-          description: "Export format",
-        },
-        limit: {
-          type: "number",
-          description: "Number of messages to export",
-        },
-        dateRange: {
-          type: "object",
-          properties: {
-            start: { type: "string", description: "Start date (ISO 8601)" },
-            end: { type: "string", description: "End date (ISO 8601)" },
-          },
-          description: "Date range filter",
-        },
-      },
-      required: ["channelId", "format"],
-    },
-  },
-];
+  const toolsWithMeta = tools.map(applyToolMetadata);
+
+  if (!oauthEnabled) {
+    return toolsWithMeta;
+  }
+
+  const securityScheme =
+    oauthRequiredScopes.length > 0
+      ? { type: "oauth2", scopes: oauthRequiredScopes }
+      : { type: "oauth2" };
+
+  return toolsWithMeta.map((tool) => ({
+    ...tool,
+    securitySchemes: [securityScheme],
+  }));
+};
 
 // Tool definitions
 server.setRequestHandler(ListToolsRequestSchema, async () => {
@@ -2621,6 +3052,13 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
   try {
     const { name, arguments: args } = request.params;
+    if (httpLoggingEnabled) {
+      const actionHint =
+        name === "discord_manage" && (args as any)?.action
+          ? ` action=${(args as any).action}`
+          : "";
+      logHttp(`tool_call name=${name}${actionHint}`);
+    }
     if (name !== "discord_manage") {
       assertActionAllowed(name);
     }
@@ -3621,6 +4059,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     }
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : String(error);
+    logHttp(`tool_call_error ${errorMessage}`);
     return {
       content: [{ type: "text", text: `Error: ${errorMessage}` }],
       isError: true,
@@ -3633,6 +4072,13 @@ async function main() {
   try {
     // Initialize Discord first
     await initializeDiscord();
+
+    if (oauthEnabled && (!oauthIssuer || !oauthJwksUrl)) {
+      console.error(
+        "OAuth is enabled but MCP_OAUTH_ISSUER/SUPABASE_AUTH_BASE_URL or MCP_OAUTH_JWKS_URL is missing.",
+      );
+      process.exit(1);
+    }
 
     // Check if we should use HTTP transport
     const useHttp = process.env.MCP_HTTP_PORT || process.env.PORT;
@@ -3651,6 +4097,15 @@ async function main() {
 
       const httpServer = createServer(async (req, res) => {
         const url = new URL(req.url || "/", `http://${req.headers.host}`);
+        const requestId = Math.random().toString(36).slice(2, 8);
+        const startedAt = Date.now();
+        logHttp(`${requestId} ${req.method} ${url.pathname}`);
+        res.on("finish", () => {
+          const durationMs = Date.now() - startedAt;
+          logHttp(
+            `${requestId} ${req.method} ${url.pathname} -> ${res.statusCode} ${durationMs}ms`,
+          );
+        });
 
         // CORS headers
         res.setHeader("Access-Control-Allow-Origin", "*");
@@ -3666,7 +4121,33 @@ async function main() {
           return;
         }
 
-        if (authToken && url.pathname !== "/health") {
+        if (
+          oauthEnabled &&
+          url.pathname === "/.well-known/oauth-protected-resource" &&
+          req.method === "GET"
+        ) {
+          const metadata = buildProtectedResourceMetadata(req);
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify(metadata));
+          return;
+        }
+
+        if (
+          oauthEnabled &&
+          url.pathname === oauthConsentPath &&
+          req.method === "GET"
+        ) {
+          res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+          res.end(buildConsentPageHtml());
+          return;
+        }
+
+        if (oauthEnabled && url.pathname !== "/health") {
+          const verified = await requireOAuth(req, res);
+          if (!verified) {
+            return;
+          }
+        } else if (authToken && url.pathname !== "/health") {
           if (!isAuthorized(req, authToken)) {
             rejectUnauthorized(res);
             return;
@@ -3688,6 +4169,7 @@ async function main() {
 
               // Handle the JSON-RPC request directly
               if (message.method === "initialize") {
+                logHttp(`${requestId} rpc initialize`);
                 const response = {
                   jsonrpc: "2.0",
                   id: message.id,
@@ -3705,6 +4187,7 @@ async function main() {
                 res.writeHead(200, { "Content-Type": "application/json" });
                 res.end(JSON.stringify(response));
               } else if (message.method === "tools/list") {
+                logHttp(`${requestId} rpc tools/list`);
                 // Return complete tools list
                 const tools = getAllTools();
                 const response = {
@@ -3717,7 +4200,14 @@ async function main() {
               } else if (message.method === "tools/call") {
                 // Handle tool call by name
                 try {
-                  const { name, arguments: args } = message.params;
+                  let { name, arguments: args } = message.params;
+                  const actionHint =
+                    name === "discord_manage" && (args as any)?.action
+                      ? ` action=${(args as any).action}`
+                      : "";
+                  logHttp(
+                    `${requestId} rpc tools/call name=${name}${actionHint}`,
+                  );
                   if (name === "discord_manage") {
                     const action = (args as any)?.action;
                     if (!action) {
@@ -3726,6 +4216,12 @@ async function main() {
                       );
                     }
                     assertActionAllowed(action);
+                    const { action: _action, ...params } = args as any;
+                    logHttp(
+                      `${requestId} rpc tools/call mapped=discord_manage action=${action}`,
+                    );
+                    name = action;
+                    args = params;
                   } else {
                     assertActionAllowed(name);
                   }

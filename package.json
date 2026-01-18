@@ -1,45 +1,29 @@
 {
-  "name": "discord-mcp",
-  "version": "0.0.1",
-  "description": "Model Context Protocol (MCP) server for Discord API integration",
-  "main": "dist/index.js",
-  "type": "module",
   "bin": {
     "discord-mcp": "./dist/index.js"
   },
-  "scripts": {
-    "build": "tsc",
-    "dev": "tsx src/index.ts",
-    "start": "node dist/index.js",
-    "prepare": "npm run build"
-  },
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/sashathelambo/discord-mcp.git"
-  },
-  "keywords": [
-    "mcp",
-    "discord",
-    "discord-bot",
-    "model-context-protocol"
-  ],
-  "author": "SaseQ",
-  "license": "MIT",
-  "bugs": {
-    "url": "https://github.com/sashathelambo/discord-mcp/issues"
-  },
-  "homepage": "https://github.com/sashathelambo/discord-mcp#readme",
   "dependencies": {
     "@discordjs/opus": "^0.10.0",
     "@discordjs/voice": "^0.18.0",
     "@modelcontextprotocol/sdk": "^1.25.2",
     "discord.js": "^14.21.0",
     "dotenv": "^17.2.0",
+    "jose": "^5.2.4",
     "zod": "^3.25.76"
   },
   "devDependencies": {
     "@types/node": "^24.0.15",
     "tsx": "^4.20.3",
     "typescript": "^5.8.3"
-  }
+  },
+  "main": "dist/index.js",
+  "name": "discord-mcp",
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsx src/index.ts",
+    "prepare": "npm run build",
+    "start": "node dist/index.js"
+  },
+  "type": "module",
+  "version": "0.0.1"
 }
