@@ -9,6 +9,7 @@ import { RESPONSE_ALREADY_SENT } from "@hono/node-server/utils/response";
 import { z } from "zod";
 import { Logger } from "./core/Logger.js";
 import type { OAuthManager } from "./core/OAuthManager.js";
+import type { McpAuthManager } from "./core/McpAuthManager.js";
 import { AppErrorCode, toPublicErrorPayload } from "./core/errors.js";
 import type { AuditEvent, AuditRiskTier } from "./gateway/audit-log.js";
 import type {
@@ -124,6 +125,7 @@ type HttpAppDependencies = {
     ) => Promise<string>;
     writeAuditEvent: (event: AuditEvent) => void;
     getOAuthManager: () => OAuthManager;
+    getMcpAuthManager: () => McpAuthManager;
     parseBooleanQuery: (value: string | null) => boolean | undefined;
     getAllTools: () => unknown[];
 };
@@ -138,11 +140,13 @@ export function createHttpApp(deps: HttpAppDependencies) {
         executeDiscordManageOperation,
         writeAuditEvent,
         getOAuthManager,
+        getMcpAuthManager,
         parseBooleanQuery,
         getAllTools,
     } = deps;
 
     const activeTransports = new Map<string, SSEServerTransport>();
+    const mcpConsentPath = getMcpAuthManager().getConsentPath();
     const app = new Hono<{ Bindings: HttpBindings }>();
 
     app.use(
@@ -202,8 +206,57 @@ export function createHttpApp(deps: HttpAppDependencies) {
         return c.json({ error: "Internal server error" }, 500);
     });
 
+    function mcpUnauthorized(c: any, authResult: any) {
+        return c.json(authResult.body, authResult.status, authResult.headers);
+    }
+
+    async function requireMcpAuthForJsonRpc(c: any, method?: string) {
+        const mcpAuth = getMcpAuthManager();
+        if (!mcpAuth.shouldAuthenticateJsonRpcMethod(method)) {
+            return null;
+        }
+
+        const authResult = await mcpAuth.authenticate(c.req.raw.headers, c.req.url);
+        if ("status" in authResult) {
+            return mcpUnauthorized(c, authResult);
+        }
+
+        return null;
+    }
+
+    async function requireMcpTransportAuth(c: any) {
+        const mcpAuth = getMcpAuthManager();
+        if (!mcpAuth.shouldAuthenticateTransport()) {
+            return null;
+        }
+
+        const authResult = await mcpAuth.authenticate(c.req.raw.headers, c.req.url);
+        if ("status" in authResult) {
+            return mcpUnauthorized(c, authResult);
+        }
+
+        return null;
+    }
+
+    app.get("/.well-known/oauth-protected-resource", (c) => {
+        const mcpAuth = getMcpAuthManager();
+        return c.json(
+            mcpAuth.buildProtectedResourceMetadata(c.req.raw.headers, c.req.url),
+            200,
+        );
+    });
+
+    app.get(mcpConsentPath, (c) => {
+        const mcpAuth = getMcpAuthManager();
+        return c.html(mcpAuth.buildConsentPageHtml(), 200);
+    });
+
     app.post("/", jsonRpcBodyValidator, async (c) => {
         const message = c.req.valid("json");
+        const authResponse = await requireMcpAuthForJsonRpc(c, message.method);
+        if (authResponse) {
+            return authResponse;
+        }
 
         if (message.method === "initialize") {
             return c.json(
@@ -338,6 +391,11 @@ export function createHttpApp(deps: HttpAppDependencies) {
     });
 
     app.get("/sse", async (c) => {
+        const authResponse = await requireMcpTransportAuth(c);
+        if (authResponse) {
+            return authResponse;
+        }
+
         const transport = new SSEServerTransport(
             "/message",
             c.env.outgoing,
@@ -351,6 +409,12 @@ export function createHttpApp(deps: HttpAppDependencies) {
     });
 
     app.post("/message", validator("json", (value) => value), async (c) => {
+        const rawMessage = c.req.valid("json") as { method?: string };
+        const authResponse = await requireMcpAuthForJsonRpc(c, rawMessage?.method);
+        if (authResponse) {
+            return authResponse;
+        }
+
         const sessionId =
             c.req.query("sessionId") || c.req.header("x-session-id");
         const transport = sessionId
@@ -361,8 +425,7 @@ export function createHttpApp(deps: HttpAppDependencies) {
         }
 
         try {
-            const message = c.req.valid("json");
-            await transport.handleMessage(message);
+            await transport.handleMessage(rawMessage);
             return c.json({ success: true }, 200);
         } catch (error) {
             return c.json(

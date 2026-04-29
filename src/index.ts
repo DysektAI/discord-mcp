@@ -13,6 +13,7 @@ import { DiscordService } from "./discord-service.js";
 import { DiscordController } from "./core/DiscordController.js";
 import { Logger } from "./core/Logger.js";
 import { OAuthManager } from "./core/OAuthManager.js";
+import { McpAuthManager } from "./core/McpAuthManager.js";
 import { AppErrorCode, toPublicErrorPayload } from "./core/errors.js";
 import { writeAuditEvent } from "./gateway/audit-log.js";
 import {
@@ -72,6 +73,7 @@ const server = new Server(
 let discordService: DiscordService;
 let discordController: DiscordController;
 let oauthManager: OAuthManager | null = null;
+const mcpAuthManager = McpAuthManager.fromEnv();
 const identityStore = new LocalEncryptedIdentityStore();
 const identityWorkerPool = new IdentityWorkerPool();
 const logger = Logger.getInstance().child("server");
@@ -108,6 +110,10 @@ function getOAuthManager(): OAuthManager {
         throw new Error("OAuth manager is not initialized.");
     }
     return oauthManager;
+}
+
+function getMcpAuthManager(): McpAuthManager {
+    return mcpAuthManager;
 }
 
 function parseBooleanQuery(value: string | null): boolean | undefined {
@@ -688,7 +694,7 @@ async function runWithConcurrency<TItem, TResult>(
 }
 
 function getAllTools() {
-    return [
+    const tools = [
         {
             name: "discord_manage",
             description:
@@ -748,6 +754,21 @@ function getAllTools() {
             },
         },
     ];
+
+    const securitySchemes = mcpAuthManager.getSecuritySchemes();
+    if (securitySchemes.length === 0) {
+        return tools;
+    }
+
+    return tools.map((tool) => ({
+        ...tool,
+        securitySchemes,
+        _meta: {
+            ...(tool as { _meta?: Record<string, unknown> })._meta,
+            securitySchemes,
+            "openai/visibility": "public",
+        },
+    }));
 }
 
 async function executeInvokeOperation(
@@ -1333,6 +1354,14 @@ async function main() {
 
         const useHttp = process.env.MCP_HTTP_PORT || process.env.PORT;
         const config = discordController.getConfigManager().getConfig();
+
+        const mcpAuthErrors = mcpAuthManager.getStartupErrors();
+        if (mcpAuthErrors.length > 0) {
+            for (const error of mcpAuthErrors) {
+                logger.error(error);
+            }
+            process.exit(1);
+        }
         const oauthClientId =
             config.oauth.clientId || discordService.getBotApplicationId();
 
@@ -1385,6 +1414,7 @@ async function main() {
                 executeDiscordManageOperation,
                 writeAuditEvent,
                 getOAuthManager,
+                getMcpAuthManager,
                 parseBooleanQuery,
                 getAllTools,
             });
@@ -1397,6 +1427,14 @@ async function main() {
             logger.info(
                 `OAuth callback: http://localhost:${port}/oauth/discord/callback`,
             );
+            if (mcpAuthManager.isEnabled()) {
+                logger.info(
+                    `MCP auth mode: ${mcpAuthManager.getMode()} (metadata: http://localhost:${port}/.well-known/oauth-protected-resource)`,
+                );
+                logger.info(
+                    `MCP consent page: http://localhost:${port}${mcpAuthManager.getConsentPath()}`,
+                );
+            }
         } else {
             const transport = new StdioServerTransport();
             await server.connect(transport);

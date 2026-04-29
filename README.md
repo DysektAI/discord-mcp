@@ -115,6 +115,15 @@ DISCORD_GUILD_ID=your_guild_id_here
 # DISCORD_CLIENT_ID=...
 # DISCORD_CLIENT_SECRET=...
 # DISCORD_OAUTH_REDIRECT_URI=http://localhost:1455/oauth/discord/callback
+
+# Optional MCP/ChatGPT remote auth (HTTP mode)
+# MCP_AUTH_MODE=off|mixed|required
+# MCP_HTTP_AUTH_TOKEN=change_this_to_a_long_random_value
+# MCP_OAUTH_ENABLED=true
+# MCP_OAUTH_ISSUER=https://issuer.example.com
+# MCP_OAUTH_JWKS_URL=https://issuer.example.com/.well-known/jwks.json
+# MCP_OAUTH_RESOURCE=https://mcp.yourdomain.com
+# MCP_OAUTH_REQUIRED_SCOPES=mcp:all
 ```
 
 ## HTTP Endpoints
@@ -124,8 +133,16 @@ When `MCP_HTTP_PORT` (or `PORT`) is set:
 - `GET /sse`
 - `POST /message`
 - `GET /health`
+- `GET /.well-known/oauth-protected-resource`
+- `GET /oauth/consent`
 - `GET /oauth/discord/start`
 - `GET /oauth/discord/callback`
+
+MCP remote auth is separate from Discord OAuth:
+
+- Discord OAuth (`/oauth/discord/*`) helps generate a Discord bot install URL and complete a Discord callback.
+- MCP auth protects the MCP server itself when it is exposed to remote clients such as ChatGPT Apps.
+- `MCP_AUTH_MODE=mixed` leaves `initialize` and `tools/list` open while requiring auth for `tools/call`, matching ChatGPT Developer Mode mixed-auth behavior.
 
 ## Logging
 
