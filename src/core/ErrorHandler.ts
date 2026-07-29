@@ -1,3 +1,5 @@
+import { sanitizeForLog } from "./LogSanitizer.js";
+
 export class DiscordAPIError extends Error {
   constructor(
     message: string,
@@ -38,7 +40,7 @@ export class RateLimitError extends Error {
 export class ErrorHandler {
   static handle(error: any): never {
     // Log the error for debugging
-    console.error('Discord MCP Error:', error);
+    console.error(`Discord MCP Error: ${sanitizeForLog(error)}`);
     
     // Re-throw specific error types
     if (error instanceof DiscordAPIError) {

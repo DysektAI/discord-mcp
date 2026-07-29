@@ -1,3 +1,5 @@
+import { sanitizeForLog } from "./LogSanitizer.js";
+
 export enum LogLevel {
   ERROR = 0,
   WARN = 1,
@@ -45,7 +47,7 @@ export class Logger {
     if (this.shouldLog(LogLevel.ERROR)) {
       console.error(this.formatMessage('ERROR', message));
       if (error) {
-        console.error(error);
+        console.error(sanitizeForLog(error));
       }
     }
   }
